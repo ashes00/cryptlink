@@ -164,16 +164,16 @@ class CryptLinkApp:
         self.root.rowconfigure(0, weight=1)
 
         # Configure main_frame columns with weights for proportional resizing (35% / 65%)
-        main_frame.columnconfigure(0, weight=30) # Left column (controls) - Reduced width
-        main_frame.columnconfigure(1, weight=70) # Right column (received files + logs) - Increased width
+        main_frame.columnconfigure(0, weight=0) # Left column (controls) - Let it shrink to content size
+        main_frame.columnconfigure(1, weight=1) # Right column (received files + logs) - Let it expand
         # Configure main_frame rows to allow vertical expansion
         main_frame.rowconfigure(0, weight=1) # Row for Received Files (allow expansion)
         main_frame.rowconfigure(1, weight=1) # Row for Logs (allow expansion)
 
         # --- Left Column Frame ---
         left_frame = ttk.Frame(main_frame)
-        left_frame.grid(row=0, column=0, rowspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
-        left_frame.columnconfigure(0, weight=1)
+        left_frame.grid(row=0, column=0, rowspan=2, sticky=(tk.W, tk.N, tk.S), padx=(0, 10)) # Removed tk.E from sticky
+        left_frame.columnconfigure(0, weight=1) # Allow internal content to align/expand if needed within the frame
         left_frame.rowconfigure(0, weight=0) # Certs
         left_frame.rowconfigure(1, weight=0) # Connection
         left_frame.rowconfigure(2, weight=0) # Status
@@ -184,7 +184,7 @@ class CryptLinkApp:
 
         # --- Certificate Section (in left_frame) ---
         self.cert_frame = ttk.LabelFrame(left_frame, text="Certificates & Bundles", padding="10")
-        self.cert_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5) # Use self.cert_frame
+        self.cert_frame.grid(row=0, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
         self.cert_frame.columnconfigure(1, weight=1) # Use self.cert_frame
 
         ttk.Button(self.cert_frame, text="CA Cert", command=self._select_ca).grid(row=0, column=0, padx=5, pady=2, sticky=tk.W) # Use self.cert_frame
@@ -207,36 +207,37 @@ class CryptLinkApp:
 
         # --- Connection Section (in left_frame) ---
         self.conn_frame = ttk.LabelFrame(left_frame, text="Connection", padding="10")
-        self.conn_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5) # Use self.conn_frame
+        self.conn_frame.grid(row=1, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
         self.conn_frame.columnconfigure(1, weight=1) # Use self.conn_frame
 
         ttk.Label(self.conn_frame, text="Peer IP/Host:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W) # Use self.conn_frame
-        self.peer_entry = ttk.Entry(self.conn_frame, textvariable=self.peer_ip_hostname, state='disabled', width=25) # Use self.conn_frame
+        self.peer_entry = ttk.Entry(self.conn_frame, textvariable=self.peer_ip_hostname, state='disabled', width=7) # Use self.conn_frame - Reduced width further
         self.peer_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
 
+        # Move button frame to the next row (row=1) and align right under the entry
         conn_button_frame = ttk.Frame(self.conn_frame) # Use self.conn_frame
-        conn_button_frame.grid(row=0, column=2, padx=5, pady=0, sticky=tk.E) # Use self.conn_frame
+        conn_button_frame.grid(row=1, column=1, columnspan=2, padx=5, pady=(2, 5), sticky=tk.E) # Changed row, added columnspan and padding
         self.connect_button = ttk.Button(conn_button_frame, text="Connect", command=self._connect_peer, state='disabled')
-        self.connect_button.pack(side=tk.LEFT, padx=(0, 2))
+        self.connect_button.pack(side=tk.LEFT, padx=(0, 2)) # Keep packing within the frame
         self.disconnect_button = ttk.Button(conn_button_frame, text="Disconnect", command=lambda: self._disconnect_peer(reason="User disconnected"), state='disabled')
         self.disconnect_button.pack(side=tk.LEFT)
 
         # --- Status Display Section (in left_frame) ---
         self.status_frame = ttk.LabelFrame(left_frame, text="Status", padding="10")
-        self.status_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5) # Use self.status_frame
+        self.status_frame.grid(row=2, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
         self.status_frame.columnconfigure(1, weight=1) # Use self.status_frame
 
         ttk.Label(self.status_frame, text="Status:").grid(row=0, column=0, sticky=tk.W, padx=5) # Use self.status_frame
         self.status_label = ttk.Label(self.status_frame, textvariable=self.connection_status, font=('TkDefaultFont', 10, 'bold')) # Use self.status_frame
         self.status_label.grid(row=0, column=1, sticky=tk.W, padx=5)
         ttk.Label(self.status_frame, text="Local:").grid(row=1, column=0, sticky=tk.W, padx=5) # Use self.status_frame
-        self.local_info_label = ttk.Label(self.status_frame, text=f"{self.local_hostname} ({self.local_ip})", wraplength=300) # Use self.status_frame
+        self.local_info_label = ttk.Label(self.status_frame, text=f"{self.local_hostname} ({self.local_ip})", wraplength=250) # Use self.status_frame, Added wraplength
         self.local_info_label.grid(row=1, column=1, sticky=tk.W, padx=5)
         ttk.Label(self.status_frame, text="Local FP:").grid(row=2, column=0, sticky=tk.W, padx=5) # Use self.status_frame
         self.local_fp_label = ttk.Label(self.status_frame, textvariable=self.local_fingerprint_display, font=('Courier', 9)) # Use self.status_frame
         self.local_fp_label.grid(row=2, column=1, sticky=tk.W, padx=5)
         ttk.Label(self.status_frame, text="Peer:").grid(row=3, column=0, sticky=tk.W, padx=5) # Use self.status_frame
-        self.peer_info_label = ttk.Label(self.status_frame, textvariable=self.peer_hostname, wraplength=300) # Use self.status_frame
+        self.peer_info_label = ttk.Label(self.status_frame, textvariable=self.peer_hostname, wraplength=250) # Use self.status_frame, Added wraplength
         self.peer_info_label.grid(row=3, column=1, sticky=tk.W, padx=5)
         ttk.Label(self.status_frame, text="Peer FP:").grid(row=4, column=0, sticky=tk.W, padx=5) # Use self.status_frame
         self.peer_fp_label = ttk.Label(self.status_frame, textvariable=self.peer_fingerprint_display, font=('Courier', 9)) # Use self.status_frame
@@ -244,16 +245,17 @@ class CryptLinkApp:
 
         # --- File Transfer Section (in left_frame) ---
         self.transfer_frame = ttk.LabelFrame(left_frame, text="File Transfer", padding="10")
-        self.transfer_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5) # Use self.transfer_frame
+        self.transfer_frame.grid(row=3, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
         self.transfer_frame.columnconfigure(1, weight=1) # Use self.transfer_frame
 
         self.choose_file_button = ttk.Button(self.transfer_frame, text="Choose File", command=self._choose_file, state='disabled') # Use self.transfer_frame
         self.choose_file_button.grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
-        self.file_entry = ttk.Entry(self.transfer_frame, textvariable=self.file_to_send_path, state='readonly', width=30) # Use self.transfer_frame
+        self.file_entry = ttk.Entry(self.transfer_frame, textvariable=self.file_to_send_path, state='readonly', width=8) # Use self.transfer_frame - Reduced width further
         self.file_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
 
+        # Move button frame to the next row (row=1) and align right under the entry
         transfer_button_frame = ttk.Frame(self.transfer_frame) # Use self.transfer_frame
-        transfer_button_frame.grid(row=0, column=2, padx=5, pady=0, sticky=tk.E)
+        transfer_button_frame.grid(row=1, column=1, columnspan=2, padx=5, pady=(2, 5), sticky=tk.E) # Changed row, added columnspan and padding
         transfer_button_frame.columnconfigure(0, weight=0)
         transfer_button_frame.columnconfigure(1, weight=0)
 
@@ -263,10 +265,10 @@ class CryptLinkApp:
         self.cancel_button.grid(row=0, column=1)
 
         self.progress_bar = ttk.Progressbar(self.transfer_frame, variable=self.transfer_progress, maximum=100) # Use self.transfer_frame
-        self.progress_bar.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), padx=5, pady=5)
+        self.progress_bar.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), padx=5, pady=5) # Moved to row 2
 
         status_speed_eta_frame = ttk.Frame(self.transfer_frame) # Use self.transfer_frame
-        status_speed_eta_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E))
+        status_speed_eta_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E)) # Moved to row 3
         status_speed_eta_frame.columnconfigure(1, weight=1)
         self.sender_status_label = ttk.Label(status_speed_eta_frame, textvariable=self.sender_transfer_status)
         self.sender_status_label.grid(row=0, column=0, sticky=tk.W, padx=5)
@@ -335,7 +337,7 @@ class CryptLinkApp:
 
         # CA Section (within admin_tools_frame)
         ca_frame = ttk.LabelFrame(self.admin_tools_frame, text="Certificate Authority (CA)", padding="10")
-        ca_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+        ca_frame.grid(row=0, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
         ca_frame.columnconfigure(1, weight=1)
 
         self.admin_ca_status_var = tk.StringVar(value="CA Status: Unknown")
@@ -352,7 +354,7 @@ class CryptLinkApp:
 
         # Client Bundle Section (within admin_tools_frame)
         client_frame = ttk.LabelFrame(self.admin_tools_frame, text="Generate Client Bundle (.clb)", padding="10")
-        client_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        client_frame.grid(row=1, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
         client_frame.columnconfigure(1, weight=1)
 
         ttk.Label(client_frame, text="Client Name (CN):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
@@ -1734,9 +1736,9 @@ class CryptLinkApp:
         """Shows the main connection/transfer view, hides identities."""
         try:
             # Show main view widgets
-            self.conn_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
-            self.status_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
-            self.transfer_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5)
+            self.conn_frame.grid(row=1, column=0, sticky=tk.W, pady=5) # Changed sticky
+            self.status_frame.grid(row=2, column=0, sticky=tk.W, pady=5) # Changed sticky
+            self.transfer_frame.grid(row=3, column=0, sticky=tk.W, pady=5) # Changed sticky
             self.received_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5))
 
             # Hide other views
@@ -1761,7 +1763,7 @@ class CryptLinkApp:
         self.admin_tools_frame.grid_forget()
 
         # Show identities widget
-        self.cert_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+        self.cert_frame.grid(row=0, column=0, sticky=tk.W, pady=5) # Changed sticky
 
         # Update menu state
         self.menu_bar.entryconfig("Home", state='normal')
@@ -1779,7 +1781,7 @@ class CryptLinkApp:
         self.cert_frame.grid_forget()
 
         # Show admin tools frame (spanning multiple rows conceptually)
-        self.admin_tools_frame.grid(row=0, column=0, rowspan=4, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        self.admin_tools_frame.grid(row=0, column=0, rowspan=4, sticky=tk.W, pady=5) # Changed sticky
         self._admin_check_ca_status() # Check status when showing the view
 
         # Update menu state
