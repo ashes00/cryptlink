@@ -63,7 +63,8 @@ if __name__ == "__main__":
         app = CryptLinkApp(root)
         # Now show the window
         root.deiconify()
-        root.mainloop()
+        app.run() # Call the app's run method, which includes starting the server and mainloop
+
     except Exception as e:
         print(f"\nFATAL ERROR during application startup: {e}", file=sys.stderr)
         # Try to show a final error message box
@@ -75,5 +76,3 @@ if __name__ == "__main__":
         except Exception:
             pass # Fallback to console output
         sys.exit(1)
-
-

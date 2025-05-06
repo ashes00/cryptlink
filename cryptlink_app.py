@@ -1,74 +1,82 @@
 # -*- coding: utf-8 -*-
 """
-CryptLink: Secure Peer-to-Peer File Transfer using TLS and Tkinter.
-Main Application Class.
+CryptLink: Secure Peer-to-Peer File Transfer Application
+Main application class.
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog # Keep messagebox/simpledialog for direct use
+import os
+import sys
 import socket
 import ssl
 import threading
-import os
-import sys
-import platform
-import time
-import json
-# import hashlib # No longer used directly?
 import queue
-import subprocess
+import json
+import time
 import datetime
 import base64
-import tempfile # Added for temporary files during import
+import tempfile
+import hashlib
 
-# --- Import Cryptography Components ---
-import cryptography.x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.x509.oid import NameOID # Added for Admin Tools details dialog
-from cryptography.fernet import Fernet, InvalidToken
-
-# --- Import Keyring (needed for Admin Tools) ---
-import keyring # Added for Admin Tools
-
+# --- Import Third-Party Libraries ---
+try:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.exceptions import UnsupportedAlgorithm
+    import keyring
+    import keyring.errors
+except ImportError as e:
+    # This error should ideally be caught by dependencies.py first
+    print(f"ERROR: Missing critical dependencies: {e}", file=sys.stderr)
+    # Attempt a Tkinter popup if possible, as a fallback
+    try:
+        root_err = tk.Tk()
+        root_err.withdraw()
+        messagebox.showerror("Dependency Error", f"A critical dependency is missing: {e}\nPlease run main.py to install dependencies.")
+        root_err.destroy()
+    except tk.TclError:
+        pass # Fallback to console output if Tkinter isn't fully available
+    sys.exit(1)
 
 # --- Import Local Modules ---
 try:
     import constants
     import utils
+    import gui # The new GUI module
 except ImportError as e:
-    print(f"ERROR: Failed to import local modules (constants.py, utils.py): {e}", file=sys.stderr)
-    print("Ensure all .py files are in the same directory.", file=sys.stderr)
+    print(f"ERROR: Failed to import local modules (constants.py, utils.py, gui.py): {e}", file=sys.stderr)
+    print("Ensure all .py files are in the same directory or accessible in PYTHONPATH.", file=sys.stderr)
     try:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Import Error", f"Failed to import required modules: {e}\nEnsure constants.py and utils.py are present.")
-        root.destroy()
+        root_err = tk.Tk()
+        root_err.withdraw()
+        messagebox.showerror("Import Error", f"Failed to import required modules: {e}\nEnsure constants.py, utils.py, and gui.py are present.")
+        root_err.destroy()
     except tk.TclError:
         pass
     sys.exit(1)
 
 
-# --- Main Application Class ---
-
 class CryptLinkApp:
-    def __init__(self, root):
-        self.root = root
+    def __init__(self, root_window):
+        self.root = root_window
         self.root.title(f"{constants.APP_NAME} v{constants.APP_VERSION}")
         self.root.protocol("WM_DELETE_WINDOW", self._quit_app)
-        # Set minimum size
-        self.root.minsize(1225, 500) # Adjusted min width to reduce right column size
-
-        self.style = ttk.Style()
+        # Attempt to set a modern theme
         try:
-            if "clam" in self.style.theme_names(): self.style.theme_use("clam")
-            elif "vista" in self.style.theme_names() and platform.system() == "Windows": self.style.theme_use("vista")
-            elif "aqua" in self.style.theme_names() and platform.system() == "Darwin": self.style.theme_use("aqua")
+            style = ttk.Style()
+            #('winnative', 'clam', 'alt', 'default', 'classic', 'vista', 'xpnative')
+            available_themes = style.theme_names()
+            if 'clam' in available_themes: style.theme_use('clam')
+            elif 'vista' in available_themes: style.theme_use('vista')
         except tk.TclError:
-            print("Warning: Could not set preferred theme.")
+            self._log_message("Could not set custom theme, using default.", constants.LOG_LEVEL_WARN)
 
-        # --- Certificate Paths & State ---
+
+        # --- State Variables ---
         self.ca_cert_path = tk.StringVar()
         self.client_cert_path = tk.StringVar()
         self.client_key_path = tk.StringVar()
@@ -76,1871 +84,1379 @@ class CryptLinkApp:
         self.client_cert_display_name = tk.StringVar()
         self.client_key_display_name = tk.StringVar()
 
-        self.certs_loaded_correctly = False
-        self.bundle_exported_this_session = False
-        self.loaded_from_bundle = False
-        self.identity_loaded_from_keyring = False # True if current certs came from keyring
-        self.keyring_has_user_identity = False    # True if keyring contains any CryptLink identity
-        self.temp_cert_files = []
-
-        # --- Connection State ---
+        self.connection_status = tk.StringVar(value="Initializing...")
         self.peer_ip_hostname = tk.StringVar()
-        self.local_ip = utils.get_local_ip()
-        self.local_hostname = socket.gethostname()
-        self.local_full_fingerprint = None
         self.local_fingerprint_display = tk.StringVar(value="N/A")
-        self.peer_full_fingerprint = None
         self.peer_fingerprint_display = tk.StringVar(value="N/A")
-        self.peer_hostname = tk.StringVar(value="N/A")
-        self.connection_status = tk.StringVar(value="No Certs")
-        self.server_socket = None
-        self.client_socket = None
-        self.peer_info = {}
-        self.server_thread = None
-        self.client_thread = None
-        self.listen_thread = None
-        self.is_connected = False
-        self.is_connecting = False
-        self.is_server_running = False
-        self.stop_server_event = threading.Event()
-        self.heartbeat_timer = None
-        self.last_heartbeat_ack_time = 0
-        self.connection_confirmation_queue = queue.Queue()
+        self.peer_hostname = tk.StringVar(value="N/A") # For display
 
-        # --- File Transfer State ---
         self.file_to_send_path = tk.StringVar()
-        self.transfer_progress = tk.DoubleVar()
+        self.transfer_progress = tk.DoubleVar(value=0.0)
+        self.sender_transfer_status = tk.StringVar()
         self.transfer_speed = tk.StringVar(value="Speed: N/A")
         self.transfer_eta = tk.StringVar(value="ETA: N/A")
-        self.sender_transfer_status = tk.StringVar(value="")
-        self.is_transferring = False
-        self.transfer_cancelled = threading.Event()
-        self.transfer_start_time = 0
-        self.bytes_transferred = 0
-        self.total_file_size = 0
-        self.current_transfer_id = 0
-        self.receiving_file_handle = None
-        self.receiving_file_path = None
-        self.transfer_lock = threading.Lock()
-        self.send_lock = threading.Lock() # Added lock for _send_command
-        self.sender_status_clear_timer = None
-        self._pending_transfer_request = None
 
-        # --- Received Files ---
-        self.received_files = {}
-
-        # --- Admin Tools State ---
-        self.admin_tools_window = None # No longer used for Toplevel
-        self.admin_ca_cert = None
-        self.admin_ca_key = None
-
-        # --- GUI Update Queue ---
-        self.gui_queue = queue.Queue()
-        self._after_id_queue = None # Initialize to None
-
-        self._load_identity_from_keyring_on_startup() # Attempt to load identity early
-        # --- Build GUI ---
-        self._create_widgets()
-        self._update_local_info()
-        self._update_status_display()
-
-
-    def _create_widgets(self):
-        # --- Menu Bar ---
-        self.menu_bar = tk.Menu(self.root)
-        self.root.config(menu=self.menu_bar)
-
-        # --- Top-Level Menu Commands ---
-        self.menu_bar.add_command(label="Home", command=self._show_main_view, state='disabled')
-        self.menu_bar.add_command(label="Identities", command=self._show_identities_view, state='normal')
-        self.menu_bar.add_command(label="Admin Tools", command=self._show_admin_tools_view, state='normal') # Changed from cascade
-
-        # File Menu (Example - you might already have one)
-        # file_menu = tk.Menu(self.menu_bar, tearoff=0)
-        # self.menu_bar.add_cascade(label="File", menu=file_menu)
-        # file_menu.add_command(label="Exit", command=self._quit_app)
-
-
-        # --- Main Frame Setup (2 Columns) ---
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-
-        # Configure main_frame columns with weights for proportional resizing (35% / 65%)
-        main_frame.columnconfigure(0, weight=0) # Left column (controls) - Let it shrink to content size
-        main_frame.columnconfigure(1, weight=1) # Right column (received files + logs) - Let it expand
-        # Configure main_frame rows to allow vertical expansion
-        main_frame.rowconfigure(0, weight=1) # Row for Received Files (allow expansion)
-        main_frame.rowconfigure(1, weight=1) # Row for Logs (allow expansion)
-
-        # --- Left Column Frame ---
-        left_frame = ttk.Frame(main_frame)
-        left_frame.grid(row=0, column=0, rowspan=2, sticky=(tk.W, tk.N, tk.S), padx=(0, 10)) # Removed tk.E from sticky
-        left_frame.columnconfigure(0, weight=1) # Allow internal content to align/expand if needed within the frame
-        left_frame.rowconfigure(0, weight=0) # Certs
-        left_frame.rowconfigure(1, weight=0) # Connection
-        left_frame.rowconfigure(2, weight=0) # Status
-        left_frame.rowconfigure(3, weight=0) # Transfer
-        left_frame.rowconfigure(4, weight=0) # Admin Tools (will occupy row 0-3 when shown)
-        left_frame.rowconfigure(4, weight=1) # Filler/Spacing
-        left_frame.rowconfigure(5, weight=0) # Quit Button
-
-        # --- Certificate Section (in left_frame) ---
-        self.cert_frame = ttk.LabelFrame(left_frame, text="Certificates & Bundles", padding="10")
-        self.cert_frame.grid(row=0, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
-        self.cert_frame.columnconfigure(1, weight=1) # Use self.cert_frame
-
-        ttk.Button(self.cert_frame, text="CA Cert", command=self._select_ca).grid(row=0, column=0, padx=5, pady=2, sticky=tk.W) # Use self.cert_frame
-        self.ca_entry = ttk.Entry(self.cert_frame, textvariable=self.ca_cert_display_name, state='readonly', width=20) # Use self.cert_frame
-        self.ca_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
-        self.save_certs_button = ttk.Button(self.cert_frame, text="Load Certs", command=self._save_certs, state='disabled') # Use self.cert_frame
-        self.save_certs_button.grid(row=0, column=2, padx=5, pady=2, sticky=tk.E)
-
-        ttk.Button(self.cert_frame, text="Client Cert", command=self._select_cert).grid(row=1, column=0, padx=5, pady=2, sticky=tk.W) # Use self.cert_frame
-        self.cert_entry = ttk.Entry(self.cert_frame, textvariable=self.client_cert_display_name, state='readonly', width=20) # Use self.cert_frame
-        self.cert_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
-        self.export_bundle_button = ttk.Button(self.cert_frame, text="Export Bundle", command=self._export_bundle, state='disabled') # Use self.cert_frame
-        self.export_bundle_button.grid(row=1, column=2, padx=5, pady=2, sticky=tk.E)
-
-        ttk.Button(self.cert_frame, text="Client Key", command=self._select_key).grid(row=2, column=0, padx=5, pady=2, sticky=tk.W) # Use self.cert_frame
-        self.key_entry = ttk.Entry(self.cert_frame, textvariable=self.client_key_display_name, state='readonly', width=20) # Use self.cert_frame
-        self.key_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
-        self.import_bundle_button = ttk.Button(self.cert_frame, text="Import Bundle", command=self._import_bundle, state='normal') # Use self.cert_frame
-        self.import_bundle_button.grid(row=2, column=2, padx=5, pady=2, sticky=tk.E)
-
-        # --- Connection Section (in left_frame) ---
-        self.conn_frame = ttk.LabelFrame(left_frame, text="Connection", padding="10")
-        self.conn_frame.grid(row=1, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
-        self.conn_frame.columnconfigure(1, weight=1) # Use self.conn_frame
-
-        ttk.Label(self.conn_frame, text="Peer IP/Host:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W) # Use self.conn_frame
-        self.peer_entry = ttk.Entry(self.conn_frame, textvariable=self.peer_ip_hostname, state='disabled', width=7) # Use self.conn_frame - Reduced width further
-        self.peer_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
-
-        # Move button frame to the next row (row=1) and align right under the entry
-        conn_button_frame = ttk.Frame(self.conn_frame) # Use self.conn_frame
-        conn_button_frame.grid(row=1, column=1, columnspan=2, padx=5, pady=(2, 5), sticky=tk.E) # Changed row, added columnspan and padding
-        self.connect_button = ttk.Button(conn_button_frame, text="Connect", command=self._connect_peer, state='disabled')
-        self.connect_button.pack(side=tk.LEFT, padx=(0, 2)) # Keep packing within the frame
-        self.disconnect_button = ttk.Button(conn_button_frame, text="Disconnect", command=lambda: self._disconnect_peer(reason="User disconnected"), state='disabled')
-        self.disconnect_button.pack(side=tk.LEFT)
-
-        # --- Status Display Section (in left_frame) ---
-        self.status_frame = ttk.LabelFrame(left_frame, text="Status", padding="10")
-        self.status_frame.grid(row=2, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
-        self.status_frame.columnconfigure(1, weight=1) # Use self.status_frame
-
-        ttk.Label(self.status_frame, text="Status:").grid(row=0, column=0, sticky=tk.W, padx=5) # Use self.status_frame
-        self.status_label = ttk.Label(self.status_frame, textvariable=self.connection_status, font=('TkDefaultFont', 10, 'bold')) # Use self.status_frame
-        self.status_label.grid(row=0, column=1, sticky=tk.W, padx=5)
-        ttk.Label(self.status_frame, text="Local:").grid(row=1, column=0, sticky=tk.W, padx=5) # Use self.status_frame
-        self.local_info_label = ttk.Label(self.status_frame, text=f"{self.local_hostname} ({self.local_ip})", wraplength=250) # Use self.status_frame, Added wraplength
-        self.local_info_label.grid(row=1, column=1, sticky=tk.W, padx=5)
-        ttk.Label(self.status_frame, text="Local FP:").grid(row=2, column=0, sticky=tk.W, padx=5) # Use self.status_frame
-        self.local_fp_label = ttk.Label(self.status_frame, textvariable=self.local_fingerprint_display, font=('Courier', 9)) # Use self.status_frame
-        self.local_fp_label.grid(row=2, column=1, sticky=tk.W, padx=5)
-        ttk.Label(self.status_frame, text="Peer:").grid(row=3, column=0, sticky=tk.W, padx=5) # Use self.status_frame
-        self.peer_info_label = ttk.Label(self.status_frame, textvariable=self.peer_hostname, wraplength=250) # Use self.status_frame, Added wraplength
-        self.peer_info_label.grid(row=3, column=1, sticky=tk.W, padx=5)
-        ttk.Label(self.status_frame, text="Peer FP:").grid(row=4, column=0, sticky=tk.W, padx=5) # Use self.status_frame
-        self.peer_fp_label = ttk.Label(self.status_frame, textvariable=self.peer_fingerprint_display, font=('Courier', 9)) # Use self.status_frame
-        self.peer_fp_label.grid(row=4, column=1, sticky=tk.W, padx=5)
-
-        # --- File Transfer Section (in left_frame) ---
-        self.transfer_frame = ttk.LabelFrame(left_frame, text="File Transfer", padding="10")
-        self.transfer_frame.grid(row=3, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
-        self.transfer_frame.columnconfigure(1, weight=1) # Use self.transfer_frame
-
-        self.choose_file_button = ttk.Button(self.transfer_frame, text="Choose File", command=self._choose_file, state='disabled') # Use self.transfer_frame
-        self.choose_file_button.grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
-        self.file_entry = ttk.Entry(self.transfer_frame, textvariable=self.file_to_send_path, state='readonly', width=8) # Use self.transfer_frame - Reduced width further
-        self.file_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
-
-        # Move button frame to the next row (row=1) and align right under the entry
-        transfer_button_frame = ttk.Frame(self.transfer_frame) # Use self.transfer_frame
-        transfer_button_frame.grid(row=1, column=1, columnspan=2, padx=5, pady=(2, 5), sticky=tk.E) # Changed row, added columnspan and padding
-        transfer_button_frame.columnconfigure(0, weight=0)
-        transfer_button_frame.columnconfigure(1, weight=0)
-
-        self.send_file_button = ttk.Button(transfer_button_frame, text="Send File", command=self._send_file, state='disabled')
-        self.send_file_button.grid(row=0, column=0, padx=(0, 2))
-        self.cancel_button = ttk.Button(transfer_button_frame, text="Cancel", command=lambda: self._cancel_transfer(notify_peer=True), state='disabled') # Parent is already correct
-        self.cancel_button.grid(row=0, column=1)
-
-        self.progress_bar = ttk.Progressbar(self.transfer_frame, variable=self.transfer_progress, maximum=100) # Use self.transfer_frame
-        self.progress_bar.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), padx=5, pady=5) # Moved to row 2
-
-        status_speed_eta_frame = ttk.Frame(self.transfer_frame) # Use self.transfer_frame
-        status_speed_eta_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E)) # Moved to row 3
-        status_speed_eta_frame.columnconfigure(1, weight=1)
-        self.sender_status_label = ttk.Label(status_speed_eta_frame, textvariable=self.sender_transfer_status)
-        self.sender_status_label.grid(row=0, column=0, sticky=tk.W, padx=5)
-        self.speed_label = ttk.Label(status_speed_eta_frame, textvariable=self.transfer_speed)
-        self.speed_label.grid(row=0, column=1, sticky=tk.W, padx=5)
-        self.eta_label = ttk.Label(status_speed_eta_frame, textvariable=self.transfer_eta)
-        self.eta_label.grid(row=0, column=2, sticky=tk.E, padx=5)
-
-        # --- Quit Button (in left_frame) ---
-        self.quit_button = ttk.Button(left_frame, text="Quit", command=self._quit_app)
-        self.quit_button.grid(row=5, column=0, sticky=tk.E, pady=10, padx=5) # Use self.quit_button
-
-        # --- Received Files Section (Right Column, Row 0) ---
-        self.received_frame = ttk.LabelFrame(main_frame, text="Received Files (Double-click to open)", padding="10") # Assign to self.received_frame
-        self.received_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5)) # Use self.received_frame here too
-        self.received_frame.columnconfigure(0, weight=1) # Use self.received_frame
-        self.received_frame.rowconfigure(0, weight=1) # Use self.received_frame
-
-        self.received_listbox = tk.Listbox(self.received_frame, height=5, width=40) # Use self.received_frame
-        self.received_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        self.received_listbox.bind("<Double-Button-1>", self._open_received_file)
-        recv_scrollbar_y = ttk.Scrollbar(self.received_frame, orient=tk.VERTICAL, command=self.received_listbox.yview) # Use self.received_frame
-        recv_scrollbar_y.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        self.received_listbox['yscrollcommand'] = recv_scrollbar_y.set
-        recv_scrollbar_x = ttk.Scrollbar(self.received_frame, orient=tk.HORIZONTAL, command=self.received_listbox.xview) # Use self.received_frame
-        recv_scrollbar_x.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E))
-        self.received_listbox['xscrollcommand'] = recv_scrollbar_x.set
-
-        # --- Logging Section (Right Column, Row 1) ---
-        # Use LabelFrame for consistent border and title
-        self.log_frame_outer = ttk.LabelFrame(main_frame, text="Logs", padding="10")
-        self.log_frame_outer.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5, 0)) # Use self.log_frame_outer
-        # Configure resizing for log_frame_outer's internal grid
-        self.log_frame_outer.columnconfigure(0, weight=1) # Text area column expands # Use self.log_frame_outer
-        self.log_frame_outer.columnconfigure(1, weight=0) # Scrollbar column doesn't expand # Use self.log_frame_outer
-        self.log_frame_outer.rowconfigure(0, weight=0) # Button row doesn't expand # Use self.log_frame_outer
-        self.log_frame_outer.rowconfigure(1, weight=1) # Text area row expands # Use self.log_frame_outer
-        self.log_frame_outer.rowconfigure(2, weight=0) # Horizontal scrollbar row doesn't expand # Use self.log_frame_outer
-
-        # Frame for Copy/Clear buttons (inside the LabelFrame)
-        log_button_frame = ttk.Frame(self.log_frame_outer) # Use self.log_frame_outer
-        # Place buttons in row 0, spanning relevant columns, sticking East
-        log_button_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.E), pady=(0, 5))
-
-        self.copy_log_button = ttk.Button(log_button_frame, text="Copy", command=self._copy_logs)
-        self.clear_log_button = ttk.Button(log_button_frame, text="Clear", command=self._clear_logs)
-        self.clear_log_button.pack(side=tk.RIGHT, padx=5) # Pack within button frame
-        self.copy_log_button.pack(side=tk.RIGHT, padx=5) # Pack within button frame
-
-        # Text widget and scrollbars directly inside log_frame_outer
-        self.log_text = tk.Text(self.log_frame_outer, height=10, state='disabled', wrap=tk.WORD, width=50) # Use self.log_frame_outer
-        self.log_text.grid(row=1, column=0, sticky="nsew") # Row 1, below buttons
-
-        log_scrollbar_y = ttk.Scrollbar(self.log_frame_outer, orient=tk.VERTICAL, command=self.log_text.yview) # Use self.log_frame_outer
-        log_scrollbar_y.grid(row=1, column=1, sticky=(tk.N, tk.S)) # Row 1, next to text
-        self.log_text['yscrollcommand'] = log_scrollbar_y.set
-
-        log_scrollbar_x = ttk.Scrollbar(self.log_frame_outer, orient=tk.HORIZONTAL, command=self.log_text.xview) # Use self.log_frame_outer
-        log_scrollbar_x.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E)) # Row 2, below text
-        self.log_text['xscrollcommand'] = log_scrollbar_x.set
-
-        # --- Admin Tools Section (in left_frame, initially hidden) ---
-        self.admin_tools_frame = ttk.Frame(left_frame, padding="5")
-        # We will grid this later in _show_admin_tools_view
-        self.admin_tools_frame.columnconfigure(0, weight=1)
-
-        # CA Section (within admin_tools_frame)
-        ca_frame = ttk.LabelFrame(self.admin_tools_frame, text="Certificate Authority (CA)", padding="10")
-        ca_frame.grid(row=0, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
-        ca_frame.columnconfigure(1, weight=1)
-
-        self.admin_ca_status_var = tk.StringVar(value="CA Status: Unknown")
-        ttk.Label(ca_frame, textvariable=self.admin_ca_status_var).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2)
-        self.admin_load_ca_button = ttk.Button(ca_frame, text="Load/Create CA", command=self._admin_load_create_ca)
-        self.admin_load_ca_button.grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-
-        ca_button_frame = ttk.Frame(ca_frame)
-        ca_button_frame.grid(row=1, column=1, sticky=tk.E, padx=5, pady=5)
-        self.admin_export_ca_button = ttk.Button(ca_button_frame, text="Export CA...", command=self._admin_export_ca, state='disabled')
-        self.admin_export_ca_button.pack(side=tk.LEFT, padx=(0, 5))
-        self.admin_clear_ca_button = ttk.Button(ca_button_frame, text="Clear CA", command=self._admin_clear_ca, state='disabled')
-        self.admin_clear_ca_button.pack(side=tk.LEFT)
-
-        # Client Bundle Section (within admin_tools_frame)
-        client_frame = ttk.LabelFrame(self.admin_tools_frame, text="Generate Client Bundle (.clb)", padding="10")
-        client_frame.grid(row=1, column=0, sticky=tk.W, pady=5) # Changed sticky to tk.W
-        client_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(client_frame, text="Client Name (CN):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
-        self.admin_client_cn_var = tk.StringVar()
-        self.admin_client_cn_entry = ttk.Entry(client_frame, textvariable=self.admin_client_cn_var, width=30)
-        self.admin_client_cn_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
-
-        self.admin_generate_bundle_button = ttk.Button(client_frame, text="Generate Bundle", command=self._admin_generate_bundle, state='disabled')
-        self.admin_generate_bundle_button.grid(row=1, column=0, columnspan=2, padx=5, pady=5)
-
-        # --- End Admin Tools Section ---
-
-        # --- Identity Persistence Section (in left_frame, for Identities View) ---
-        self.identity_persistence_frame = ttk.LabelFrame(left_frame, text="Identity Persistence (Keyring)", padding="10")
-        # We will grid this later in _show_identities_view
-        self.identity_persistence_frame.columnconfigure(0, weight=1, uniform="id_persist_buttons") # Make buttons same width
-        self.identity_persistence_frame.columnconfigure(1, weight=1, uniform="id_persist_buttons")
-
-        self.save_identity_button = ttk.Button(self.identity_persistence_frame, text="Save to Keyring", command=self._save_current_identity_to_keyring, state='disabled')
-        self.save_identity_button.grid(row=0, column=0, padx=5, pady=5, sticky=tk.EW)
-
-        self.clear_identity_button = ttk.Button(self.identity_persistence_frame, text="Clear from Keyring", command=self._clear_identity_from_keyring_action, state='disabled')
-        self.clear_identity_button.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
-        # --- End Identity Persistence Section ---
-
-        # Set initial view
-        self._show_main_view()
-
-        # Start GUI queue processing after all widgets are created
-        if not self._after_id_queue: self._after_id_queue = self.root.after(100, self._process_gui_queue)
-    # --- GUI Update & Logging ---
-    def _log_message(self, message, level=constants.LOG_LEVEL_INFO):
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entry = f"[{now}] [{level}] {message}\n"
-        self.gui_queue.put(("log", log_entry))
-    def _update_log_widget(self, log_entry):
-        try:
-             if not self.log_text.winfo_exists(): return
-             self.log_text.config(state='normal')
-             self.log_text.insert(tk.END, log_entry)
-             self.log_text.see(tk.END)
-             self.log_text.config(state='disabled')
-        except tk.TclError:
-             print("Log widget destroyed, message ignored:", log_entry.strip())
-    def _process_gui_queue(self):
-        try:
-            while True:
-                message_type, data = self.gui_queue.get_nowait()
-                if not self.root.winfo_exists(): break
-                if message_type == "log": self._update_log_widget(data)
-                elif message_type == "status": self._set_connection_status(data)
-                elif message_type == "peer_info": self._update_peer_info_display(data[0], data[1])
-                elif message_type == "disconnect": self._handle_disconnection_ui(data)
-                elif message_type == "progress": self._update_progress_display(*data)
-                elif message_type == "transfer_complete": self._handle_transfer_complete_ui(data)
-                elif message_type == "transfer_cancelled_ui": self._handle_transfer_cancelled_ui(data)
-                elif message_type == "add_received_file": self._add_received_file_display(data[0], data[1])
-                elif message_type == "show_error": messagebox.showerror("Error", data, parent=self.root)
-                elif message_type == "show_info": messagebox.showinfo("Info", data, parent=self.root)
-                elif message_type == "ask_connection_confirm":
-                      peer_host, peer_ip, peer_fp_display, confirm_q = data
-                      accept = messagebox.askyesno("Confirm Peer Connection", f"Accept incoming connection from:\nHost: {peer_host} ({peer_ip})\nFingerprint: {peer_fp_display}\n\nVerify fingerprint with sender before accepting.", parent=self.root)
-                      confirm_q.put(accept)
-                elif message_type == "ask_yes_no":
-                      transfer_id, filename, filesize_str = data
-                      accept = messagebox.askyesno("Incoming File Transfer", f"Accept file '{filename}' ({filesize_str}) from peer?", parent=self.root)
-                      threading.Thread(target=self._respond_to_file_request, args=(accept, transfer_id, filename), daemon=True).start()
-                elif message_type == "sender_status": self._update_sender_status(*data)
-        except queue.Empty: pass
-        except tk.TclError: pass # Usually means root window is destroyed
-        except Exception as e:
-             print(f"Error processing GUI queue: {e}")
-             self._log_message(f"Error processing GUI queue: {e}", constants.LOG_LEVEL_ERROR)
-        finally:
-            if self.root.winfo_exists(): self._after_id_queue = self.root.after(100, self._process_gui_queue)
-    def _set_connection_status(self, status):
-        self.connection_status.set(status)
-        self._update_status_display()
-        self._update_identity_persistence_buttons_state() # Update persistence buttons too
-    def _update_status_display(self):
-        if not self.root.winfo_exists(): return
-        status = self.connection_status.get()
-        peer_entry_state = 'disabled'; connect_button_state = 'disabled'; disconnect_button_state = 'disabled'
-        choose_file_button_state = 'disabled'; send_file_button_state = 'disabled'; cancel_button_state = 'disabled'
-        export_bundle_button_state = 'disabled'; import_bundle_button_state = 'normal'
-        save_certs_button_state = 'normal' if (self.ca_cert_display_name.get() and self.client_cert_display_name.get() and self.client_key_display_name.get()) else 'disabled'
-        status_color = "red"
-        if status == "No Certs": pass
-        elif status == "Certs Loaded":
-            status_color = "darkorange"
-            if self.certs_loaded_correctly: peer_entry_state = 'normal'; connect_button_state = 'normal'; export_bundle_button_state = 'normal'
-        elif status == "Disconnected":
-            status_color = "darkorange"
-            if self.certs_loaded_correctly: peer_entry_state = 'normal'; connect_button_state = 'normal'; export_bundle_button_state = 'normal'
-            else: export_bundle_button_state = 'disabled'
-        elif status == "Connecting":
-            status_color = "blue"; disconnect_button_state = 'normal'; import_bundle_button_state = 'disabled'
-            export_bundle_button_state = 'disabled'; save_certs_button_state = 'disabled'
-        elif status == "Confirming Peer":
-             status_color = "purple"; disconnect_button_state = 'normal'; import_bundle_button_state = 'disabled'
-             export_bundle_button_state = 'disabled'; save_certs_button_state = 'disabled'
-        elif status == "Securely Connected":
-            status_color = "green"; disconnect_button_state = 'normal'; choose_file_button_state = 'normal'
-            send_file_button_state = 'normal' if self.file_to_send_path.get() else 'disabled'
-            export_bundle_button_state = 'normal'; import_bundle_button_state = 'disabled'; save_certs_button_state = 'disabled'
-        else: status_color = "red"
-        try:
-            self.status_label.config(foreground=status_color)
-            self.peer_entry.config(state=peer_entry_state)
-            self.connect_button.config(state=connect_button_state)
-            self.disconnect_button.config(state=disconnect_button_state)
-            self.choose_file_button.config(state=choose_file_button_state)
-            self.send_file_button.config(state=send_file_button_state)
-            self.save_certs_button.config(state=save_certs_button_state)
-            self.import_bundle_button.config(state=import_bundle_button_state)
-            self.export_bundle_button.config(state=export_bundle_button_state)
-            if self.is_transferring:
-                 self.cancel_button.config(state='normal'); self.choose_file_button.config(state='disabled')
-                 self.send_file_button.config(state='disabled'); self.disconnect_button.config(state='disabled')
-                 self.connect_button.config(state='disabled'); self.import_bundle_button.config(state='disabled')
-                 self.export_bundle_button.config(state='disabled'); self.save_certs_button.config(state='disabled')
-                 if hasattr(self, 'save_identity_button'): self.save_identity_button.config(state='disabled') # Also disable save identity during transfer
-            else:
-                 self.cancel_button.config(state='disabled')
-                 if not self.sender_status_clear_timer: self.sender_transfer_status.set("")
-        except tk.TclError as e: print(f"Error updating widget states (window likely closing): {e}")
-    def _update_local_info(self):
-        if not self.root.winfo_exists(): return
-        self.local_info_label.config(text=f"{self.local_hostname} ({self.local_ip})")
-        cert_path = self.client_cert_path.get()
-        if cert_path:
-             self.local_full_fingerprint = utils.get_certificate_fingerprint(cert_path)
-             self.local_fingerprint_display.set(utils.format_fingerprint_display(self.local_full_fingerprint))
-        else:
-             self.local_full_fingerprint = None; self.local_fingerprint_display.set("N/A")
-    def _update_peer_info_display(self, peer_host, peer_info_dict):
-        if not self.root.winfo_exists(): return
-        self.peer_info = peer_info_dict
-        hostname = peer_info_dict.get('hostname', 'N/A'); ip = peer_info_dict.get('ip', 'N/A')
-        self.peer_full_fingerprint = peer_info_dict.get('fingerprint', None)
-        self.peer_hostname.set(f"{hostname} ({ip})")
-        self.peer_fingerprint_display.set(utils.format_fingerprint_display(self.peer_full_fingerprint))
-        if self.connection_status.get() == "Securely Connected": self.peer_ip_hostname.set(peer_host or ip)
-        self._log_message(f"Received peer info: {hostname}({ip}) FP: {self.peer_fingerprint_display.get()}")
-    def _clear_peer_info_display(self):
-        if not self.root.winfo_exists(): return
-        self.peer_hostname.set("N/A"); self.peer_fingerprint_display.set("N/A")
-        self.peer_full_fingerprint = None; self.peer_info = {}; self.peer_ip_hostname.set("")
-    def _visual_feedback(self, button, original_text, feedback_text="Done"):
-        try:
-            if button and isinstance(button, ttk.Button) and button.winfo_exists():
-                 original_state = button.cget("state")
-                 button.config(text=feedback_text, state=tk.DISABLED)
-                 self.root.after(2000, lambda b=button, ot=original_text, os=original_state: self._revert_button_config(b, ot, os))
-            elif button: print(f"Warning: _visual_feedback called on non-button or non-existent widget: {button}")
-        except Exception as e:
-            print(f"Error during visual feedback for {button}: {e}")
-            try:
-                 if button and button.winfo_exists(): button.config(text=original_text, state=original_state)
-            except: pass
-    def _revert_button_config(self, button, original_text, original_state):
-         try:
-              if button and button.winfo_exists():
-                   button.config(text=original_text, state=original_state)
-                   if button == self.export_bundle_button and not self.certs_loaded_correctly: button.config(state=tk.DISABLED)
-                   elif button == self.save_certs_button and not (self.ca_cert_display_name.get() and self.client_cert_display_name.get() and self.client_key_display_name.get()): button.config(state=tk.DISABLED)
-         except tk.TclError as e: print(f"Info: Could not revert button config (widget likely destroyed): {e}")
-         except Exception as e: print(f"Error reverting button config: {e}")
-
-    # --- Certificate Handling Callbacks ---
-    def _check_enable_load_certs(self):
-         can_load = bool(self.ca_cert_display_name.get() and self.client_cert_display_name.get() and self.client_key_display_name.get())
-         self.save_certs_button.config(state='normal' if can_load else 'disabled')
-         self.export_bundle_button.config(state='normal' if self.certs_loaded_correctly else 'disabled')
-    def _select_file(self, variable, display_variable, title):
-        initial_dir = os.getcwd()
-        filename = filedialog.askopenfilename(title=title, filetypes=[("All files", "*.*")], initialdir=initial_dir, parent=self.root)
-        if filename:
-            variable.set(filename)
-            display_variable.set(os.path.basename(filename))
-            self._log_message(f"Selected {title}: {os.path.basename(filename)}")
-            if self.certs_loaded_correctly:
-                self.certs_loaded_correctly = False
-                self.gui_queue.put(("status", "No Certs"))
-                self.local_fingerprint_display.set("N/A")
-                self.local_full_fingerprint = None
-            self.bundle_exported_this_session = False
-            self.loaded_from_bundle = False
-            self._cleanup_temp_files()
-            self.identity_loaded_from_keyring = False # Manual selection clears keyring load status
-            self._check_enable_load_certs()
-    def _select_ca(self): self._select_file(self.ca_cert_path, self.ca_cert_display_name, "Select CA Certificate")
-    def _select_cert(self): self._select_file(self.client_cert_path, self.client_cert_display_name, "Select Client Certificate")
-    def _select_key(self): self._select_file(self.client_key_path, self.client_key_display_name, "Select Client Private Key")
-    def _save_certs(self):
         self.certs_loaded_correctly = False
-        ca_path = self.ca_cert_path.get(); cert_path = self.client_cert_path.get(); key_path = self.client_key_path.get()
-        if not (ca_path and cert_path and key_path): self.gui_queue.put(("show_error", "Internal error: Missing certificate path data.")); return
-        if not all(os.path.exists(p) for p in [ca_path, cert_path, key_path]):
-             self.gui_queue.put(("show_error", "One or more certificate/key files not found at the specified paths.\nPlease re-select or re-import."))
-             self.ca_cert_display_name.set(""); self.client_cert_display_name.set(""); self.client_key_display_name.set("")
-             self._check_enable_load_certs(); return
+        self.bundle_exported_this_session = False # Track if current certs came from manual load and were then exported
+        self.loaded_from_bundle = False # True if current certs were loaded from a .clb file
+        self.identity_loaded_from_keyring = False # True if current identity loaded from system keyring
+        self.keyring_has_user_identity = False # Updated by _load_identity_from_keyring_on_startup
+
+        self.is_connected = False
+        self.is_connecting = False
+        self.is_transferring = False
+        self.transfer_cancelled_by_user = False
+        self.current_transfer_info = {} # {'filename', 'filesize', 'role': 'sender'/'receiver'}
+        self.received_files = {} # display_name: full_path
+        self.temp_cert_files = [] # Store paths of temporary cert files from bundle import
+
+        # --- Networking ---
+        self.local_ip = utils.get_local_ip()
+        self.local_hostname = socket.gethostname()
+        self.server_socket = None
+        self.client_socket = None # Represents the active connection socket (either from server or client role)
+        self.ssl_context = None
+        self.peer_info = {} # Store dict of peer's hostname, ip, fingerprint
+        self.local_full_fingerprint = None
+        self.peer_full_fingerprint = None
+
+        # --- Threading & Queues ---
+        self.gui_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.server_thread = None
+        self.client_connection_thread = None # For outgoing connections
+        self.heartbeat_thread = None
+        self.heartbeat_lock = threading.Lock()
+        self.last_heartbeat_ack_time = 0
+        self.sender_status_clear_timer = None # For gui.py to manage
+
+        # --- Admin Tools Specific ---
+        self.admin_ca_cert = None # Stores loaded CA cert (PEM bytes) for admin use
+        self.admin_ca_key = None  # Stores loaded CA key (PEM bytes) for admin use
+
+        # --- Create GUI Widgets (delegated to gui.py) ---
+        gui.create_widgets(self) # Pass self (app instance) to gui functions
+
+        # --- Initial Setup ---
+        gui.update_local_info(self)
+        self._load_identity_from_keyring_on_startup() # Attempt to load saved identity
+        if not self.certs_loaded_correctly:
+            gui.set_connection_status(self, "No Certs")
+
+        self._process_gui_queue() # Start the GUI queue processor
+
+    def _log_message(self, message, level=constants.LOG_LEVEL_INFO):
+        """Formats and queues a message for logging in the GUI."""
+        if level < constants.CURRENT_LOG_LEVEL:
+            return
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        self.gui_queue.put(("log", log_entry))
+        if level >= constants.LOG_LEVEL_ERROR: # Also print errors to stderr
+            print(f"ERROR: {message}", file=sys.stderr)
+
+    def _process_gui_queue(self):
+        """Processes messages from the GUI queue to update Tkinter widgets safely."""
         try:
-            full_fp = utils.get_certificate_fingerprint(cert_path)
-            if full_fp in ["Error", "Parse Error", None]:
-                 if full_fp == "Parse Error": raise ValueError("Could not parse client certificate (invalid PEM format?).")
-                 else: raise ValueError(f"Could not read client certificate or calculate fingerprint ({full_fp}). Path: {cert_path}")
-            self.local_full_fingerprint = full_fp; self.local_fingerprint_display.set(utils.format_fingerprint_display(full_fp))
-            try:
-                 with open(key_path, "rb") as key_file: serialization.load_pem_private_key(key_file.read(), password=None, backend=default_backend())
-            except ValueError as key_e: raise ValueError(f"Error loading private key file: {key_e}. Check format (PEM) and ensure it's not password protected. Path: {key_path}") from key_e
-            except TypeError as key_e:
-                 if "private key is encrypted" in str(key_e): raise ValueError("Private key is password protected (passwords not supported).") from key_e
-                 else: raise ValueError(f"Error loading private key: {key_e}") from key_e
-            except Exception as key_e: raise ValueError(f"Cannot read private key file. Path: {key_path}. Error: {key_e}") from key_e
-            try:
-                 with open(ca_path, "rb") as ca_file: cryptography.x509.load_pem_x509_certificate(ca_file.read(), default_backend())
-            except ValueError as ca_e: raise ValueError(f"Error loading CA certificate: {ca_e}. Check format (PEM). Path: {ca_path}") from ca_e
-            except Exception as ca_e: raise ValueError(f"Cannot read CA certificate file. Path: {ca_path}. Error: {ca_e}") from ca_e
-            self.certs_loaded_correctly = True; self._log_message("Certificate and key files validated successfully.")
-            self._visual_feedback(self.save_certs_button, "Load Certs", "Loaded!"); self._update_local_info()
-            self.gui_queue.put(("status", "Certs Loaded")); self._check_enable_load_certs(); self._start_server_if_needed()
+            while not self.gui_queue.empty():
+                msg_type, data = self.gui_queue.get_nowait()
+                if not self.root.winfo_exists(): # Check if root window is still alive
+                    if msg_type != "log": # Avoid logging about log if window is gone
+                        print(f"GUI queue: Root window destroyed, discarding {msg_type}")
+                    continue
 
-            if not self.identity_loaded_from_keyring: # If not loaded from keyring at startup
-                if not self.loaded_from_bundle: # And not from a bundle file import
-                    self.root.after(100, self._prompt_export_after_load)
-            # else: # If loaded from keyring or bundle, don't prompt to export again immediately
-            self.loaded_from_bundle = False # Reset this flag after use
-            self._update_identity_persistence_buttons_state()
+                if msg_type == "log":
+                    gui.update_log_widget(self, data)
+                elif msg_type == "status":
+                    gui.set_connection_status(self, data)
+                elif msg_type == "peer_info":
+                    peer_host, peer_info_dict = data
+                    gui.update_peer_info_display(self, peer_host, peer_info_dict)
+                elif msg_type == "clear_peer_info":
+                    gui.clear_peer_info_display(self)
+                elif msg_type == "progress":
+                    progress, speed, eta = data
+                    gui.update_progress_display(self, progress, speed, eta)
+                elif msg_type == "sender_status":
+                    text, color, temporary = data
+                    gui.update_sender_status(self, text, color, temporary)
+                elif msg_type == "transfer_complete_ui":
+                    gui.handle_transfer_complete_ui(self, is_sender_role=data)
+                elif msg_type == "transfer_cancelled_ui":
+                    gui.handle_transfer_cancelled_ui(self, is_sender_role=data)
+                elif msg_type == "add_received_file":
+                    display_name, full_path = data
+                    gui.add_received_file_display(self, display_name, full_path)
+                elif msg_type == "show_error":
+                    messagebox.showerror("Error", data, parent=self.root)
+                elif msg_type == "show_info":
+                    messagebox.showinfo("Information", data, parent=self.root)
+                elif msg_type == "show_warning":
+                    messagebox.showwarning("Warning", data, parent=self.root)
+                elif msg_type == "prompt_fingerprint":
+                    peer_fp_display, callback = data
+                    self._verify_peer_fingerprint_dialog(peer_fp_display, callback)
+                elif msg_type == "prompt_file_accept":
+                    filename, filesize_str, callback = data
+                    self._prompt_accept_file_dialog(filename, filesize_str, callback)
 
-        except ValueError as e:
-             self.gui_queue.put(("show_error", f"Certificate validation failed:\n{e}"))
-             self._log_message(f"Certificate validation failed: {e}", constants.LOG_LEVEL_ERROR)
-             self.gui_queue.put(("status", "No Certs")); self.local_fingerprint_display.set("N/A"); self.local_full_fingerprint = None
-             self._check_enable_load_certs(); self.identity_loaded_from_keyring = False
-             if self.loaded_from_bundle: self._cleanup_temp_files()
-             self.loaded_from_bundle = False; self._update_identity_persistence_buttons_state()
+        except queue.Empty:
+            pass
         except Exception as e:
-            self.gui_queue.put(("show_error", f"Unexpected error validating certificates: {e}"))
-            self._log_message(f"Unexpected error validating certificates: {e}", constants.LOG_LEVEL_ERROR)
-            self.gui_queue.put(("status", "No Certs")); self.local_fingerprint_display.set("N/A"); self.local_full_fingerprint = None
-            self._check_enable_load_certs(); self.identity_loaded_from_keyring = False
-            if self.loaded_from_bundle: self._cleanup_temp_files()
-            self.loaded_from_bundle = False; self._update_identity_persistence_buttons_state()
-    def _prompt_export_after_load(self):
-        if not self.certs_loaded_correctly: return
-        if messagebox.askyesno("Export Certificate Bundle","Certificates loaded successfully.\n\nDo you want to export these certificates to a password-protected bundle for easier loading next time?", parent=self.root):
-            self._export_bundle()
-        else:
-            self._log_message("User chose not to export bundle after loading.")
-            self.bundle_exported_this_session = False
+            # Log any unexpected error during queue processing
+            self._log_message(f"Error processing GUI queue: {e}", constants.LOG_LEVEL_ERROR)
+        finally:
+            if self.root.winfo_exists(): # Schedule next check only if window exists
+                self.root.after(100, self._process_gui_queue)
 
-    # --- Bundle Import/Export ---
-    def _derive_key(self, password: str, salt: bytes) -> bytes:
-        if not isinstance(password, str) or not password: raise ValueError("Password must be a non-empty string.")
-        if not isinstance(salt, bytes) or len(salt) != constants.BUNDLE_SALT_SIZE: raise ValueError(f"Salt must be bytes of size {constants.BUNDLE_SALT_SIZE}.")
-        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=constants.BUNDLE_KDF_ITERATIONS, backend=default_backend())
-        key = base64.urlsafe_b64encode(kdf.derive(password.encode('utf-8'))); return key
-    def _encrypt_certs(self, password: str) -> tuple[bytes, bytes] | None:
-        ca_path = self.ca_cert_path.get(); cert_path = self.client_cert_path.get(); key_path = self.client_key_path.get()
-        if not (ca_path and cert_path and key_path): self._log_message("Cannot encrypt: Not all certificate paths are set.", constants.LOG_LEVEL_ERROR); return None
-        try:
-            with open(ca_path, "rb") as f: ca_data = f.read()
-            with open(cert_path, "rb") as f: cert_data = f.read()
-            with open(key_path, "rb") as f: key_data = f.read()
-            ca_name = self.ca_cert_display_name.get() or os.path.basename(ca_path)
-            cert_name = self.client_cert_display_name.get() or os.path.basename(cert_path)
-            key_name = self.client_key_display_name.get() or os.path.basename(key_path)
-        except OSError as e: self._log_message(f"Error reading certificate file for encryption: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Error reading certificate file for export:\n{e}")); return None
-        certs_dict = {"ca_name": ca_name, "cert_name": cert_name, "key_name": key_name, "ca_b64": base64.b64encode(ca_data).decode('ascii'), "cert_b64": base64.b64encode(cert_data).decode('ascii'), "key_b64": base64.b64encode(key_data).decode('ascii')}
-        certs_json = json.dumps(certs_dict).encode('utf-8'); salt = os.urandom(constants.BUNDLE_SALT_SIZE)
-        try: key = self._derive_key(password, salt); f = Fernet(key); encrypted_data = f.encrypt(certs_json); return salt, encrypted_data
-        except Exception as e: self._log_message(f"Encryption failed: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Encryption failed: {e}")); return None
-    def _decrypt_certs(self, bundle_file_path: str, password: str) -> dict | None:
-        try:
-            with open(bundle_file_path, "rb") as f:
-                salt = f.read(constants.BUNDLE_SALT_SIZE)
-                if len(salt) < constants.BUNDLE_SALT_SIZE: raise ValueError("Bundle file is too short to contain salt.")
-                encrypted_certs = f.read()
-            if not encrypted_certs: raise ValueError("Bundle file is missing encrypted data after salt.")
-            derived_key = self._derive_key(password, salt); f = Fernet(derived_key); decrypted_json = f.decrypt(encrypted_certs)
-            certs_dict_b64 = json.loads(decrypted_json.decode('utf-8'))
-            required_keys = ["ca_name", "cert_name", "key_name", "ca_b64", "cert_b64", "key_b64"]
-            if not all(k in certs_dict_b64 for k in required_keys): raise ValueError("Decrypted data is missing required certificate names or content.")
-            certs_data = {"ca_name": certs_dict_b64["ca_name"], "cert_name": certs_dict_b64["cert_name"], "key_name": certs_dict_b64["key_name"], "ca_data": base64.b64decode(certs_dict_b64["ca_b64"]), "cert_data": base64.b64decode(certs_dict_b64["cert_b64"]), "key_data": base64.b64decode(certs_dict_b64["key_b64"])}
-            return certs_data
-        except (OSError, ValueError, json.JSONDecodeError, base64.binascii.Error) as e: self._log_message(f"Failed to read or parse bundle structure: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Invalid bundle format or structure:\n{e}")); return None
-        except InvalidToken: self._log_message("Decryption failed: Invalid token (likely wrong password or corrupted bundle).", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", "Decryption failed.\nLikely incorrect password or corrupted bundle file.")); return None
-        except Exception as e: self._log_message(f"Decryption failed: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Decryption failed: {e}")); return None
-    def _export_bundle(self):
-        if not self.certs_loaded_correctly: self.gui_queue.put(("show_error", "Please load and validate certificates before exporting.")); return
-        password = simpledialog.askstring("Set Bundle Password", "Enter a password to encrypt the bundle:", show='*', parent=self.root)
-        if not password: self._log_message("Bundle export cancelled."); return
-        password_confirm = simpledialog.askstring("Confirm Password", "Confirm the password:", show='*', parent=self.root)
-        if password != password_confirm: self.gui_queue.put(("show_error", "Passwords do not match.")); return
-        bundle_path = filedialog.asksaveasfilename(title="Save Certificate Bundle", defaultextension=constants.BUNDLE_FILE_EXTENSION, filetypes=[(f"CryptLink Bundle (*{constants.BUNDLE_FILE_EXTENSION})", f"*{constants.BUNDLE_FILE_EXTENSION}"), ("All Files", "*.*")], initialdir=os.getcwd(), parent=self.root)
-        if not bundle_path: self._log_message("Bundle export cancelled."); return
-        encryption_result = self._encrypt_certs(password)
-        if not encryption_result: return
-        salt, encrypted_data = encryption_result
-        try:
-            with open(bundle_path, "wb") as f: f.write(salt); f.write(encrypted_data)
-            self._log_message(f"Certificates successfully exported to bundle: {os.path.basename(bundle_path)}")
-            self.gui_queue.put(("show_info", f"Bundle exported successfully to:\n{bundle_path}"))
-            self.bundle_exported_this_session = True
-            self._visual_feedback(self.export_bundle_button, "Export Bundle", "Exported!")
-        except OSError as e: self._log_message(f"Error writing bundle file '{bundle_path}': {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Failed to write bundle file:\n{e}"))
-        except Exception as e: self._log_message(f"Unexpected error exporting bundle: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"An unexpected error occurred during export:\n{e}"))
-    def _import_bundle(self):
-        if self.is_connected or self.is_connecting: self.gui_queue.put(("show_error", "Cannot import bundle while connected or connecting.")); return
-        bundle_path = filedialog.askopenfilename(title="Import Certificate Bundle", filetypes=[(f"CryptLink Bundle (*{constants.BUNDLE_FILE_EXTENSION})", f"*{constants.BUNDLE_FILE_EXTENSION}"), ("All Files", "*.*")], initialdir=os.getcwd(), parent=self.root)
-        if not bundle_path: self._log_message("Bundle import cancelled."); return
-        password = simpledialog.askstring("Bundle Password", "Enter the password for the bundle:", show='*', parent=self.root)
-        if not password: self._log_message("Bundle import cancelled."); return
-        certs_info = self._decrypt_certs(bundle_path, password)
-        if not certs_info: return
-        self._cleanup_temp_files(); temp_files_created = {}
-        try:
-            # Use specific keys based on data type for storing temp paths
-            temp_files_created["ca_data"] = self._write_temp_cert(certs_info["ca_data"], ".crt")
-            temp_files_created["cert_data"] = self._write_temp_cert(certs_info["cert_data"], ".crt")
-            temp_files_created["key_data"] = self._write_temp_cert(certs_info["key_data"], ".key")
+    def _save_certs(self):
+        """Validates selected certificates and key, then updates status."""
+        self._log_message("Attempting to load and validate certificates...")
+        ca_path = self.ca_cert_path.get()
+        cert_path = self.client_cert_path.get()
+        key_path = self.client_key_path.get()
 
-            self.ca_cert_path.set(temp_files_created["ca_data"]); self.client_cert_path.set(temp_files_created["cert_data"]); self.client_key_path.set(temp_files_created["key_data"])
-            self.ca_cert_display_name.set(certs_info.get("ca_name", "ca.crt")); self.client_cert_display_name.set(certs_info.get("cert_name", "client.crt")); self.client_key_display_name.set(certs_info.get("key_name", "client.key"))
-            self._log_message(f"Certificates successfully imported from bundle: {os.path.basename(bundle_path)} (using temporary files)")
-            self._visual_feedback(self.import_bundle_button, "Import Bundle", "Imported!"); self.identity_loaded_from_keyring = False # Imported from file, not keyring
-            self.loaded_from_bundle = True; self.bundle_exported_this_session = True
-            self.root.after(100, self._save_certs)
-        except (OSError, KeyError, ValueError) as e:
-            self._log_message(f"Error processing imported certificate data: {e}", constants.LOG_LEVEL_ERROR)
-            self.gui_queue.put(("show_error", f"Failed to process imported certificates:\n{e}"))
-            self._cleanup_temp_files(); self.ca_cert_path.set(""); self.client_cert_path.set(""); self.client_key_path.set("")
-            self.ca_cert_display_name.set(""); self.client_cert_display_name.set(""); self.client_key_display_name.set(""); self.loaded_from_bundle = False
-            self.identity_loaded_from_keyring = False; self._update_identity_persistence_buttons_state()
+        if not all([ca_path, cert_path, key_path]):
+            self.gui_queue.put(("show_error", "All certificate/key files must be selected."))
+            self._log_message("Certificate loading failed: Not all files selected.", constants.LOG_LEVEL_WARN)
+            return
+
+        for p, name in [(ca_path, "CA cert"), (cert_path, "Client cert"), (key_path, "Client key")]:
+            if not os.path.exists(p):
+                self.gui_queue.put(("show_error", f"{name} file not found: {os.path.basename(p)}"))
+                self._log_message(f"Certificate loading failed: {name} file not found: {p}", constants.LOG_LEVEL_ERROR)
+                return
+
+        try:
+            # Basic validation: can we load them?
+            with open(ca_path, "rb") as f: utils.load_cert_from_pem(f.read().decode('utf-8'))
+            with open(cert_path, "rb") as f: utils.load_cert_from_pem(f.read().decode('utf-8'))
+            with open(key_path, "rb") as f: utils.load_private_key_from_pem(f.read().decode('utf-8'), password=None)
+
+            self.certs_loaded_correctly = True
+            self._log_message("Certificates and key loaded and appear valid.")
+            gui.update_local_info(self) # Update fingerprint display
+            gui.set_connection_status(self, "Certs Loaded")
+            gui.visual_feedback(self, self.save_certs_button, "Load Certs", "Loaded!")
+
+            if not self.loaded_from_bundle and not self.identity_loaded_from_keyring:
+                # Only prompt if certs were manually selected and not yet exported or from keyring
+                gui.prompt_export_after_load(self)
+            gui.update_identity_persistence_buttons_state(self)
+            # Explicitly try to start the server now that certs are confirmed valid
+            self._start_server_if_needed()
+
+        except ValueError as e: # Catches errors from cryptography library loading
+            self.certs_loaded_correctly = False
+            self.gui_queue.put(("show_error", f"Error loading certificate/key: {e}"))
+            self._log_message(f"Certificate validation error: {e}", constants.LOG_LEVEL_ERROR)
+            gui.set_connection_status(self, "No Certs")
+            self.local_fingerprint_display.set("N/A")
+            self.local_full_fingerprint = None
         except Exception as e:
-             self._log_message(f"Unexpected error during bundle import processing: {e}", constants.LOG_LEVEL_ERROR)
-             self.gui_queue.put(("show_error", f"An unexpected error occurred during import:\n{e}"))
-             self._cleanup_temp_files(); self.ca_cert_path.set(""); self.client_cert_path.set(""); self.client_key_path.set("")
-             self.ca_cert_display_name.set(""); self.client_cert_display_name.set(""); self.client_key_display_name.set(""); self.loaded_from_bundle = False; self.identity_loaded_from_keyring = False; self._update_identity_persistence_buttons_state()
+            self.certs_loaded_correctly = False
+            self.gui_queue.put(("show_error", f"An unexpected error occurred validating certificates: {e}"))
+            self._log_message(f"Unexpected certificate validation error: {e}", constants.LOG_LEVEL_ERROR)
+            gui.set_connection_status(self, "No Certs")
+            self.local_fingerprint_display.set("N/A")
+            self.local_full_fingerprint = None
+        finally:
+            gui.check_enable_load_certs(self) # Update button states regardless
 
-    def _write_temp_cert(self, data: bytes, suffix: str) -> str:
-        """Writes data to a temporary file and returns the path."""
-        # delete=False is crucial here so the file persists after the 'with' block
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, mode='wb') as tf:
-            tf.write(data)
-            self.temp_cert_files.append(tf.name) # Track for cleanup
-            return tf.name
+    def _prepare_bundle_data_for_encryption(self, password):
+        """Reads current cert/key files, returns salt and encrypted data for bundle."""
+        if not self.certs_loaded_correctly:
+            self._log_message("Cannot prepare bundle data: Certificates not loaded correctly.", constants.LOG_LEVEL_ERROR)
+            return None
+        try:
+            with open(self.ca_cert_path.get(), "rb") as f: ca_data = f.read()
+            with open(self.client_cert_path.get(), "rb") as f: cert_data = f.read()
+            with open(self.client_key_path.get(), "rb") as f: key_data = f.read()
+
+            # Use utils function to perform the encryption logic
+            return utils.create_encrypted_bundle_from_data(
+                password,
+                ca_data, cert_data, key_data,
+                self.ca_cert_display_name.get(),
+                self.client_cert_display_name.get(),
+                self.client_key_display_name.get()
+            )
+        except Exception as e:
+            self._log_message(f"Error preparing bundle data for encryption: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"Failed to prepare bundle data:\n{e}"))
+            return None
+
+    def _decrypt_bundle_data_from_file(self, bundle_path, password):
+        """Reads and decrypts a bundle file, returns dictionary of certs_info."""
+        try:
+            # utils.load_encrypted_bundle returns (bundle_data, message) or (None, message)
+            bundle_data, message = utils.load_encrypted_bundle(bundle_path, password)
+            if bundle_data:
+                return bundle_data
+            else:
+                # Log the message from utils.load_encrypted_bundle if it failed there
+                self._log_message(f"Bundle decryption/load failed: {message}", constants.LOG_LEVEL_ERROR)
+                # The InvalidToken exception below will handle showing a generic error to the user
+                # or we can show the specific message if it's not an InvalidToken.
+                if "Invalid password or corrupt bundle" not in message and "Bundle file not found" not in message : # Avoid duplicate generic messages
+                    self.gui_queue.put(("show_error", f"Failed to load bundle: {message}"))
+                return None # Ensure None is returned on failure
+        except InvalidToken:
+            self._log_message("Bundle decryption failed: Invalid password or corrupt bundle.", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", "Invalid password or corrupt bundle file."))
+            return None
+        except Exception as e:
+            self._log_message(f"Error decrypting bundle data: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"Failed to decrypt bundle:\n{e}"))
+            return None
+
+    def _write_temp_cert(self, cert_data_pem, suffix=".crt"):
+        """Writes certificate data to a temporary file and returns its path."""
+        # Ensure cert_data_pem is bytes
+        if isinstance(cert_data_pem, str):
+            cert_data_pem = cert_data_pem.encode('utf-8')
+
+        fd, temp_path = tempfile.mkstemp(suffix=suffix, prefix="cryptlink_")
+        with os.fdopen(fd, "wb") as f:
+            f.write(cert_data_pem)
+        self.temp_cert_files.append(temp_path)
+        self._log_message(f"Created temporary certificate file: {os.path.basename(temp_path)}", constants.LOG_LEVEL_DEBUG)
+        return temp_path
 
     def _cleanup_temp_files(self):
+        """Deletes any temporary certificate files created during bundle import."""
         cleaned_count = 0
-        for temp_path in list(self.temp_cert_files):
+        for path in self.temp_cert_files:
             try:
-                if os.path.exists(temp_path): os.remove(temp_path); cleaned_count += 1
-                if temp_path in self.temp_cert_files: self.temp_cert_files.remove(temp_path)
-            except OSError as e: self._log_message(f"Error removing temporary file {temp_path}: {e}", constants.LOG_LEVEL_WARN)
-            except Exception as e: self._log_message(f"Unexpected error cleaning temp file {temp_path}: {e}", constants.LOG_LEVEL_WARN)
-        if cleaned_count > 0: self._log_message(f"Cleaned up {cleaned_count} temporary certificate files.")
-        self.identity_loaded_from_keyring = False # If we cleanup, they are no longer from keyring directly
-    def _create_ssl_context(self, purpose):
-         if not self.certs_loaded_correctly: self._log_message("Cannot create SSL context: Certs not loaded correctly.", constants.LOG_LEVEL_ERROR); return None
-         ca_path = self.ca_cert_path.get(); cert_path = self.client_cert_path.get(); key_path = self.client_key_path.get()
-         if not all(os.path.exists(p) for p in [ca_path, cert_path, key_path]):
-             self._log_message("Cannot create SSL context: One or more cert/key files not found at specified paths.", constants.LOG_LEVEL_ERROR)
-             self.gui_queue.put(("show_error", "One or more certificate/key files could not be found.\nPlease re-select or re-import."))
-             self.certs_loaded_correctly = False; self.gui_queue.put(("status", "No Certs")); self._check_enable_load_certs(); return None
-         if not all([ca_path, cert_path, key_path]): self._log_message("Cannot create SSL context: Missing cert paths.", constants.LOG_LEVEL_ERROR); return None
-         try:
-              context = ssl.SSLContext(purpose)
-              if hasattr(context, "minimum_version"): context.minimum_version = ssl.TLSVersion.TLSv1_2
-              else:
-                  context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1
-                  try:
-                      context.options |= ssl.OP_NO_TLSv1_1
-                  except AttributeError:
-                      pass
-                  print("Warning: Python < 3.6, TLSv1.2 minimum not guaranteed via modern API.")
-                  self._log_message("Attempting to disable older protocols for Python < 3.6", constants.LOG_LEVEL_WARN)
-              context.verify_mode = ssl.CERT_REQUIRED; context.check_hostname = False
-              context.load_verify_locations(cafile=ca_path); context.load_cert_chain(certfile=cert_path, keyfile=key_path)
-              self._log_message(f"SSLContext created for purpose: {purpose}", constants.LOG_LEVEL_DEBUG); return context
-         except ssl.SSLError as e: self._log_message(f"Failed to create SSLContext: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"SSL Error creating context: {e}\nCheck cert/key files again.")); self.certs_loaded_correctly = False; self.gui_queue.put(("status", "No Certs")); self._check_enable_load_certs(); return None
-         except Exception as e: self._log_message(f"Unexpected error creating SSLContext: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Unexpected error creating SSL context: {e}")); self.certs_loaded_correctly = False; self.gui_queue.put(("status", "No Certs")); self._check_enable_load_certs(); return None
+                if os.path.exists(path):
+                    os.remove(path)
+                    self._log_message(f"Cleaned up temporary file: {os.path.basename(path)}", constants.LOG_LEVEL_DEBUG)
+                    cleaned_count +=1
+            except OSError as e:
+                self._log_message(f"Error cleaning up temp file {os.path.basename(path)}: {e}", constants.LOG_LEVEL_WARN)
+        if cleaned_count > 0:
+             self._log_message(f"Cleaned up {cleaned_count} temporary certificate files.", constants.LOG_LEVEL_INFO)
+        self.temp_cert_files = []
 
-    # --- Connection Handling Methods ---
-    # ... (Methods _start_server_if_needed through _handle_peer_transfer_cancel remain the same) ...
+
+    def _create_ssl_context(self, purpose=ssl.Purpose.SERVER_AUTH):
+        """Creates and configures an SSL context."""
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT if purpose == ssl.Purpose.SERVER_AUTH else ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.check_hostname = False # We verify fingerprint manually
+
+            context.load_verify_locations(cafile=self.ca_cert_path.get())
+            context.load_cert_chain(certfile=self.client_cert_path.get(), keyfile=self.client_key_path.get())
+            self._log_message(f"SSLContext created for {'client' if purpose == ssl.Purpose.SERVER_AUTH else 'server'}. CA: {self.ca_cert_display_name.get()}, Cert: {self.client_cert_display_name.get()}", constants.LOG_LEVEL_DEBUG)
+            return context
+        except ssl.SSLError as e:
+            self._log_message(f"SSL Context Error: {e}. Check certificate paths and formats.", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"SSL Setup Error: {e}\nEnsure certificates are valid and paths are correct."))
+            return None
+        except FileNotFoundError as e:
+            self._log_message(f"SSL Context Error: Certificate file not found: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"SSL Setup Error: Certificate file not found.\n{e}"))
+            return None
+
     def _start_server_if_needed(self):
-        if self.certs_loaded_correctly and not self.is_server_running:
-             if not self.is_connected and not self.is_connecting: self._start_server()
-             else: self._log_message("Already connected/connecting as client, not starting server.", constants.LOG_LEVEL_INFO)
-    def _start_server(self):
-        if self.is_server_running: self._log_message("Server is already running.", constants.LOG_LEVEL_WARN); return
-        if not self.certs_loaded_correctly: self._log_message("Cannot start server: Certificates not loaded correctly.", constants.LOG_LEVEL_ERROR); return
-        self.is_server_running = True; self.stop_server_event.clear()
-        self.server_thread = threading.Thread(target=self._server_listen_loop, daemon=True); self.server_thread.start()
-    def _stop_server(self):
-        if not self.is_server_running: return
-        self._log_message("Stopping server thread..."); self.stop_server_event.set()
-        server_sock = self.server_socket
-        if server_sock:
-            try: dummy_sock = socket.create_connection(('127.0.0.1', constants.DEFAULT_PORT), timeout=0.1); dummy_sock.close()
-            except (socket.timeout, ConnectionRefusedError): pass
-            except Exception as e: self._log_message(f"Minor error sending dummy connection to stop server: {e}", constants.LOG_LEVEL_DEBUG)
-            try: server_sock.close(); self.server_socket = None
-            except Exception as e: self._log_message(f"Error closing server socket: {e}", constants.LOG_LEVEL_WARN)
-        if self.server_thread and self.server_thread.is_alive():
-            self.server_thread.join(timeout=1.0)
-            if self.server_thread.is_alive(): self._log_message("Server thread did not stop gracefully after join.", constants.LOG_LEVEL_WARN)
-        self.is_server_running = False; self.server_thread = None
+        """Starts the server listening thread if certs are loaded and it's not already running."""
+        if self.certs_loaded_correctly and (not self.server_thread or not self.server_thread.is_alive()):
+            self.stop_event.clear()
+            self.server_thread = threading.Thread(target=self._server_listen_loop, daemon=True)
+            self.server_thread.start()
+            self._log_message(f"Server listening on {self.local_ip}:{constants.DEFAULT_PORT}")
+        elif not self.certs_loaded_correctly:
+            self._log_message("Cannot start server: Certificates not loaded.", constants.LOG_LEVEL_WARN)
+
     def _server_listen_loop(self):
-        self.server_socket = None; ssl_context = None
+        """Listens for incoming connections and handles them in new threads."""
+        self.ssl_context = self._create_ssl_context(purpose=ssl.Purpose.CLIENT_AUTH)
+        if not self.ssl_context:
+            self._log_message("Server cannot start: Failed to create SSL context.", constants.LOG_LEVEL_ERROR)
+            gui.set_connection_status(self, "SSL Error")
+            return
+
         try:
-            ssl_context = self._create_ssl_context(ssl.PROTOCOL_TLS_SERVER)
-            if not ssl_context: raise ValueError("Failed to create SSLContext for server.")
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM); self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind(('', constants.DEFAULT_PORT)); self.server_socket.listen(1); self.server_socket.settimeout(1.0)
-            self._log_message(f"Server listening on port {constants.DEFAULT_PORT}")
-            while not self.stop_server_event.is_set():
-                if self.is_connected or self.is_connecting: time.sleep(0.5); continue
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind(('0.0.0.0', constants.DEFAULT_PORT)) # Listen on all interfaces
+            self.server_socket.listen(1) # Listen for one connection at a time
+            self.server_socket.settimeout(1.0) # Timeout to check stop_event
+
+            self._log_message(f"Server socket bound and listening on {self.local_ip}:{constants.DEFAULT_PORT}.", constants.LOG_LEVEL_DEBUG)
+
+            while not self.stop_event.is_set():
+                if self.is_connected or self.is_connecting: # Don't accept new if already busy
+                    time.sleep(0.5)
+                    continue
                 try:
-                    conn_unwrapped, addr = self.server_socket.accept(); self._log_message(f"Incoming connection attempt from {addr}")
-                    if self.is_connected or self.is_connecting: self._log_message("Already connected/connecting, rejecting new connection.", constants.LOG_LEVEL_WARN); conn_unwrapped.close(); continue
-                    handler_thread = threading.Thread(target=self._handle_client_connection, args=(conn_unwrapped, addr, ssl_context), daemon=True); handler_thread.start()
-                except socket.timeout: continue
-                except OSError as e:
-                     if self.stop_server_event.is_set() or "Socket operation on non-socket" in str(e) or "Bad file descriptor" in str(e): self._log_message("Server socket closed, exiting listen loop.", constants.LOG_LEVEL_INFO)
-                     else: self._log_message(f"Server socket OS error: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Server socket error: {e}. Try restarting.")); self.gui_queue.put(("status", "No Certs"))
-                     break
-                except Exception as e: self._log_message(f"Unexpected error in server accept loop: {e}", constants.LOG_LEVEL_ERROR); time.sleep(1)
-        except ValueError as e: self._log_message(f"Server thread cannot start: {e}", constants.LOG_LEVEL_ERROR)
-        except ssl.SSLError as e: self._log_message(f"Server thread failed due to SSL config: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Server SSL setup failed: {e}")); self.gui_queue.put(("status", "No Certs"))
-        except OSError as e: self._log_message(f"Server thread failed to bind/listen: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Failed to start server on port {constants.DEFAULT_PORT}: {e}\nAnother application might be using the port.")); self.gui_queue.put(("status", "No Certs"))
-        except Exception as e: self._log_message(f"Server thread failed unexpectedly: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Server failed: {e}")); self.gui_queue.put(("status", "No Certs"))
+                    conn, addr = self.server_socket.accept()
+                    self._log_message(f"Incoming connection from {addr[0]}:{addr[1]}")
+                    if self.is_connected or self.is_connecting:
+                        self._log_message("Already connected/connecting, rejecting new incoming connection.", constants.LOG_LEVEL_WARN)
+                        conn.close()
+                        continue
+
+                    self.is_connecting = True
+                    self.gui_queue.put(("status", "Connecting"))
+                    # Pass the raw socket `conn` to _handle_client_connection
+                    threading.Thread(target=self._handle_client_connection, args=(conn, addr), daemon=True).start()
+                except socket.timeout:
+                    continue # Loop to check stop_event
+                except Exception as e:
+                    if not self.stop_event.is_set(): # Don't log if we are stopping
+                        self._log_message(f"Server accept error: {e}", constants.LOG_LEVEL_ERROR)
+                    break # Exit loop on other errors
+        except OSError as e: # e.g. Address already in use
+             self._log_message(f"Server socket error: {e}", constants.LOG_LEVEL_ERROR)
+             self.gui_queue.put(("show_error", f"Could not start server: {e}\nAnother application might be using port {constants.DEFAULT_PORT}."))
+             self.gui_queue.put(("status", "Port Error"))
         finally:
-            self.is_server_running = False;
-            if self.is_connecting: self.is_connecting = False
             if self.server_socket:
-                try:
-                    self.server_socket.close()
-                except Exception:
-                    pass
+                self.server_socket.close()
                 self.server_socket = None
-            self._log_message("Server listening loop stopped.")
-            if self.certs_loaded_correctly and not self.is_connected: self.gui_queue.put(("status", "Disconnected"))
-            elif not self.certs_loaded_correctly: self.gui_queue.put(("status", "No Certs"))
-    def _handle_client_connection(self, conn_unwrapped, addr, context):
-        wrapped_socket = None; connection_confirmed = False; peer_host = "N/A"
+            self._log_message("Server listening loop stopped.", constants.LOG_LEVEL_DEBUG)
+            if not self.is_connected and not self.is_connecting and self.certs_loaded_correctly:
+                 self.gui_queue.put(("status", "Certs Loaded")) # Or Disconnected if it was previously connected
+
+    def _handle_client_connection(self, conn_socket, addr):
+        """Handles an incoming client connection (SSL handshake, peer verification)."""
+        peer_ip = addr[0]
+        self.client_socket = None # Ensure it's clean before assignment
+        self._log_message(f"SERVER_HANDLE: Thread started for {peer_ip}.", constants.LOG_LEVEL_DEBUG)
         try:
-            self.is_connecting = True; self.gui_queue.put(("status", "Connecting"))
-            self._log_message(f"Attempting TLS handshake with {addr} (Server Role)...")
-            wrapped_socket = context.wrap_socket(conn_unwrapped, server_side=True)
-            self._log_message(f"TLS Handshake successful with {addr}. Awaiting confirmation...")
-            peer_cert_bin = wrapped_socket.getpeercert(binary_form=True)
-            if not peer_cert_bin: raise ConnectionError("Could not get peer certificate after handshake.")
-            peer_cert = cryptography.x509.load_der_x509_certificate(peer_cert_bin, default_backend()); peer_fp_bytes = peer_cert.fingerprint(hashes.SHA256())
-            peer_full_fp = peer_fp_bytes.hex().upper(); peer_fp_display = utils.format_fingerprint_display(peer_full_fp)
-            peer_ip = addr[0]
-            try:
-                peer_host, _ = socket.getnameinfo(addr, 0)
-            except socket.gaierror:
-                peer_host = peer_ip
-            self.gui_queue.put(("status", "Confirming Peer")); confirm_data = (peer_host, peer_ip, peer_fp_display, self.connection_confirmation_queue); self.gui_queue.put(("ask_connection_confirm", confirm_data))
-            try:
-                 accept = self.connection_confirmation_queue.get(timeout=constants.CONFIRMATION_TIMEOUT)
-                 if accept: connection_confirmed = True; self._log_message(f"User accepted connection from {peer_host} ({peer_ip}).")
-                 else: self._log_message(f"User rejected connection from {peer_host} ({peer_ip}).")
-            except queue.Empty: self._log_message(f"Connection confirmation timed out for {peer_host} ({peer_ip}). Rejecting.")
-            if not connection_confirmed: wrapped_socket.close(); conn_unwrapped.close(); self.is_connecting = False; self.gui_queue.put(("status", "Disconnected")); return
-            self.client_socket = wrapped_socket; self.is_connected = True; self.is_connecting = False
-            peer_info_dict = {"ip": peer_ip, "hostname": peer_host, "fingerprint": peer_full_fp}
-            self.gui_queue.put(("peer_info", (peer_host, peer_info_dict))); self.gui_queue.put(("status", "Securely Connected"))
-            self._log_message(f"Peer connection confirmed and established with {peer_host} ({peer_ip}).")
-            self._send_command({"command": "PEER_INFO", "hostname": self.local_hostname, "ip": self.local_ip, "fingerprint": self.local_full_fingerprint})
-            self._start_listen_thread(wrapped_socket); self._start_heartbeat()
-        except ssl.SSLCertVerificationError as e: self._log_message(f"TLS Handshake failed (Cert Verify) with {addr}: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Connection failed: Peer certificate verification error.\nEnsure peer uses a certificate signed by the loaded CA."))
-        except ssl.SSLError as e: self._log_message(f"TLS Handshake failed (SSL Error) with {addr}: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Connection failed: TLS handshake error with {addr}.\n{e}"))
-        except socket.error as e: self._log_message(f"Socket error during handshake/setup with {addr}: {e}", constants.LOG_LEVEL_ERROR)
-        except ConnectionError as e: self._log_message(f"Connection error during post-handshake setup with {addr}: {e}", constants.LOG_LEVEL_ERROR)
-        except Exception as e: self._log_message(f"Error handling connection from {addr}: {e}", constants.LOG_LEVEL_ERROR)
+            self._log_message(f"SERVER_HANDLE: Attempting SSL wrap for {peer_ip}.", constants.LOG_LEVEL_DEBUG)
+            self.client_socket = self.ssl_context.wrap_socket(conn_socket, server_side=True)
+            self._log_message(f"SERVER_HANDLE: SSL handshake successful with {peer_ip}. Performing peer verification.", constants.LOG_LEVEL_DEBUG)
+
+            # Exchange peer info (hostname, IP, cert fingerprint)
+            self._log_message(f"SERVER_HANDLE: Getting peer certificate from {peer_ip}.", constants.LOG_LEVEL_DEBUG)
+            peer_cert = self.client_socket.getpeercert(binary_form=True)
+            if not peer_cert:
+                self._log_message(f"SERVER_HANDLE: Could not get peer certificate from {peer_ip}.", constants.LOG_LEVEL_ERROR)
+                raise ssl.SSLError("Could not get peer certificate.")
+            self._log_message(f"SERVER_HANDLE: Calculating peer fingerprint for {peer_ip}.", constants.LOG_LEVEL_DEBUG)
+            self.peer_full_fingerprint = hashlib.sha256(peer_cert).hexdigest()
+            peer_fp_display = utils.format_fingerprint_display(self.peer_full_fingerprint)
+            self._log_message(f"SERVER_HANDLE: Peer {peer_ip} fingerprint: {peer_fp_display}", constants.LOG_LEVEL_DEBUG)
+
+            # Send our info
+            self._log_message(f"SERVER_HANDLE: Preparing to send local info to {peer_ip}.", constants.LOG_LEVEL_DEBUG)
+            local_info = self._get_local_peer_info()
+            if local_info.get("fingerprint") is None: # This check was for the "N/A_FP" case, which is now handled in _get_local_peer_info
+                self._log_message(f"SERVER_HANDLE: CRITICAL - Local fingerprint is None when sending PEER_INFO to {peer_ip}.", constants.LOG_LEVEL_ERROR)
+
+            self._log_message(f"SERVER_HANDLE: Sending PEER_INFO to {peer_ip}: {local_info}", constants.LOG_LEVEL_DEBUG)
+            self._send_command(self.client_socket, {"type": "PEER_INFO", "data": local_info})
+            self._log_message(f"SERVER_HANDLE: PEER_INFO sent to {peer_ip}.", constants.LOG_LEVEL_DEBUG)
+
+            # Receive peer's info
+            self._log_message(f"SERVER_HANDLE: Receiving PEER_INFO from {peer_ip}.", constants.LOG_LEVEL_DEBUG)
+            peer_info_cmd = self._receive_command(self.client_socket)
+            if not peer_info_cmd or peer_info_cmd.get("type") != "PEER_INFO":
+                self._log_message(f"SERVER_HANDLE: Failed to receive PEER_INFO from {peer_ip} or malformed.", constants.LOG_LEVEL_ERROR)
+                raise ConnectionError("Failed to receive peer info or malformed command.")
+            self._log_message(f"SERVER_HANDLE: Received PEER_INFO from {peer_ip}: {peer_info_cmd['data']}", constants.LOG_LEVEL_DEBUG)
+            self.gui_queue.put(("peer_info", (peer_ip, peer_info_cmd["data"])))
+
+            # Fingerprint verification dialog (via GUI queue)
+            verification_event = threading.Event()
+            user_accepted = None
+            def set_verification_result(accepted):
+                nonlocal user_accepted
+                user_accepted = accepted
+                verification_event.set()
+
+            self.gui_queue.put(("status", "Confirming Peer"))
+            self.gui_queue.put(("prompt_fingerprint", (peer_fp_display, set_verification_result)))
+            verification_event.wait(timeout=constants.CONFIRMATION_TIMEOUT) # Wait for user input
+
+            if user_accepted is None: # Timeout
+                self._log_message("Peer fingerprint confirmation timed out.", constants.LOG_LEVEL_WARN)
+                self._send_command(self.client_socket, {"type": "VERIFICATION_REJECTED", "reason": "Timeout"})
+                raise ConnectionRefusedError("Fingerprint confirmation timed out.")
+            elif user_accepted:
+                self._log_message("Peer fingerprint accepted by user.", constants.LOG_LEVEL_INFO)
+                self._send_command(self.client_socket, {"type": "VERIFICATION_ACCEPTED"})
+                self._log_message(f"SERVER_HANDLE: Socket timeout before set to None: {self.client_socket.gettimeout()}", constants.LOG_LEVEL_DEBUG)
+                self.client_socket.settimeout(None) # Ensure blocking reads for comms loop
+                self.is_connected = True
+                self.is_connecting = False
+                self.gui_queue.put(("status", "Securely Connected"))
+                self._start_heartbeat()
+                self._communication_loop() # Start receiving commands
+            else: # User rejected
+                self._log_message("Peer fingerprint rejected by user.", constants.LOG_LEVEL_WARN)
+                self._send_command(self.client_socket, {"type": "VERIFICATION_REJECTED", "reason": "User rejected"})
+                raise ConnectionRefusedError("Fingerprint rejected by user.")
+
+        except (ssl.SSLError, ConnectionError, socket.error, json.JSONDecodeError) as e:
+            self._log_message(f"SERVER_HANDLE: Connection handling error with {peer_ip}: {e}", constants.LOG_LEVEL_ERROR)
+            if self.client_socket: self.client_socket.close() # Close the wrapped socket
+            else: conn_socket.close() # Close the raw socket if wrapping failed
+            self.client_socket = None
+            self.is_connecting = False
+            self.is_connected = False
+            self.gui_queue.put(("clear_peer_info", None))
+            if self.certs_loaded_correctly: self.gui_queue.put(("status", "Disconnected"))
+            else: self.gui_queue.put(("status", "No Certs"))
+        except Exception as e: # Catch any other unexpected error
+            self._log_message(f"SERVER_HANDLE: Unexpected error handling client {peer_ip}: {e}", constants.LOG_LEVEL_ERROR)
+            if self.client_socket: self.client_socket.close()
+            else: conn_socket.close()
+            self.client_socket = None
+            self.is_connecting = False
+            self.is_connected = False
+            self.gui_queue.put(("clear_peer_info", None))
+            if self.certs_loaded_correctly: self.gui_queue.put(("status", "Disconnected"))
+            else: self.gui_queue.put(("status", "No Certs"))
         finally:
-             if not self.is_connected:
-                 if wrapped_socket:
-                     try:
-                         wrapped_socket.close()
-                     except Exception:
-                         pass
-                 if conn_unwrapped:
-                     try:
-                         conn_unwrapped.close()
-                     except Exception:
-                         pass
-                 if self.is_connecting:
-                      self.is_connecting = False;
-                      if self.connection_status.get() not in ["Disconnected", "No Certs", "Certs Loaded"]: self.gui_queue.put(("status", "Disconnected"))
+            self._log_message(f"SERVER_HANDLE: Thread finished for {peer_ip}.", constants.LOG_LEVEL_DEBUG)
+
+
     def _connect_peer(self):
-        if not self.certs_loaded_correctly: self.gui_queue.put(("show_error", "Load and validate certificates before connecting.")); return
-        if self.is_connected or self.is_connecting: self._log_message("Already connected or connecting.", constants.LOG_LEVEL_WARN); return
-        peer_address = self.peer_ip_hostname.get().strip()
-        if not peer_address: self.gui_queue.put(("show_error", "Please enter the Peer IP or Hostname.")); return
-        self.gui_queue.put(("status", "Connecting")); self.is_connecting = True; self._stop_server()
-        self.client_thread = threading.Thread(target=self._initiate_connection, args=(peer_address,), daemon=True); self.client_thread.start()
-    def _initiate_connection(self, peer_address):
-        unwrapped_socket = None; wrapped_socket = None; peer_ip = None; connection_succeeded = False; ssl_context = None
-        try:
-            ssl_context = self._create_ssl_context(ssl.PROTOCOL_TLS_CLIENT)
-            if not ssl_context: raise ValueError("Failed to create SSLContext for client.")
-            try: addr_info = socket.getaddrinfo(peer_address, constants.DEFAULT_PORT, socket.AF_INET, socket.SOCK_STREAM); peer_ip = addr_info[0][4][0]; self._log_message(f"Resolved '{peer_address}' to {peer_ip}")
-            except socket.gaierror: self._log_message(f"Could not resolve hostname: {peer_address}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Could not resolve hostname: {peer_address}")); return
-            self._log_message(f"Attempting to connect to {peer_address} ({peer_ip}) on port {constants.DEFAULT_PORT}...")
-            unwrapped_socket = socket.create_connection((peer_ip, constants.DEFAULT_PORT), timeout=constants.SOCKET_TIMEOUT)
-            self._log_message("Socket connected, attempting TLS handshake (Client Role)...")
-            hostname_for_tls = peer_address if not peer_ip == peer_address else None
-            wrapped_socket = ssl_context.wrap_socket(unwrapped_socket, server_side=False, server_hostname=hostname_for_tls)
-            self.client_socket = wrapped_socket; self.is_connected = True; self.is_connecting = False; connection_succeeded = True
-            peer_cert_bin = wrapped_socket.getpeercert(binary_form=True)
-            if not peer_cert_bin: raise ConnectionError("Could not get peer certificate after handshake.")
-            peer_cert = cryptography.x509.load_der_x509_certificate(peer_cert_bin, default_backend()); peer_fp_bytes = peer_cert.fingerprint(hashes.SHA256())
-            peer_full_fp = peer_fp_bytes.hex().upper(); peer_host = peer_address
-            peer_info_dict = {"ip": peer_ip, "hostname": peer_host, "fingerprint": peer_full_fp}
-            self.gui_queue.put(("peer_info", (peer_host, peer_info_dict))); self.gui_queue.put(("status", "Securely Connected"))
-            self._log_message(f"TLS Handshake successful with {peer_host} ({peer_ip}).")
-            self._send_command({"command": "PEER_INFO", "hostname": self.local_hostname, "ip": self.local_ip, "fingerprint": self.local_full_fingerprint})
-            self._start_listen_thread(wrapped_socket); self._start_heartbeat()
-        except socket.timeout: self._log_message(f"Connection timed out to {peer_address}.", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Connection to {peer_address} timed out."))
-        except socket.error as e: self._log_message(f"Socket error connecting to {peer_address}: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Could not connect to {peer_address}: {e}"))
-        except ssl.SSLCertVerificationError as e: self._log_message(f"Certificate verification failed for {peer_address}: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Certificate verification failed for {peer_address}.\nEnsure peer uses a certificate signed by the loaded CA and that the CA cert is correct."))
-        except ssl.SSLError as e: self._log_message(f"SSL Error connecting to {peer_address}: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"SSL connection error with {peer_address}: {e}"))
-        except ConnectionError as e: self._log_message(f"Connection error during connect/setup with {peer_address}: {e}", constants.LOG_LEVEL_ERROR)
-        except ValueError as e: self._log_message(f"Client connection cannot start: {e}", constants.LOG_LEVEL_ERROR)
-        except Exception as e: self._log_message(f"Unexpected error connecting to {peer_address}: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"An unexpected error occurred: {e}"))
-        finally:
-            if not connection_succeeded:
-                 if wrapped_socket:
-                     try:
-                         wrapped_socket.close()
-                     except Exception:
-                         pass
-                 elif unwrapped_socket:
-                     try:
-                         unwrapped_socket.close()
-                     except Exception:
-                         pass
-                 self.client_socket = None
-                 if self.is_connecting:
-                      self.is_connecting = False;
-                      if self.connection_status.get() == "Connecting": self.gui_queue.put(("status", "Disconnected"))
-                 self.root.after(100, self._start_server_if_needed)
-    def _disconnect_peer(self, reason="User disconnected", notify_peer=True):
-        current_status = self.connection_status.get()
-        if current_status in ["Disconnected", "No Certs", "Certs Loaded"]: return
-        if self.is_connecting:
-             self._log_message(f"Disconnect requested during connection attempt. Cancelling. Reason: {reason}", constants.LOG_LEVEL_INFO)
-             self.is_connecting = False; self.is_connected = False; sock_to_close = self.client_socket
-             if sock_to_close:
-                 try:
-                     sock_to_close.close()
-                 except Exception:
-                     pass
-             self.client_socket = None; self.gui_queue.put(("disconnect", f"Connection attempt cancelled: {reason}")); return
-        self._log_message(f"Disconnecting from peer. Reason: {reason}")
-        if self.heartbeat_timer: self.heartbeat_timer.cancel(); self.heartbeat_timer = None; self._log_message("Heartbeat timer cancelled.")
-        if self.sender_status_clear_timer: self.sender_status_clear_timer.cancel(); self.sender_status_clear_timer = None; self._log_message("Sender status clear timer cancelled.")
-        if self.is_transferring: self._log_message("Cancelling active transfer due to disconnect."); self._cancel_transfer(notify_peer=False, reason="Disconnecting")
-        sock_to_close = self.client_socket; self.client_socket = None; self.is_connected = False; self.is_connecting = False
-        if notify_peer and sock_to_close: threading.Thread(target=self._send_disconnect_notification, args=(sock_to_close, reason), daemon=True).start()
-        else: self._close_socket_gracefully(sock_to_close)
-        if self.listen_thread and self.listen_thread.is_alive():
-            if threading.current_thread() != self.listen_thread:
-                self._log_message("Waiting briefly for listen thread to exit..."); self.listen_thread.join(timeout=0.5)
-                if self.listen_thread.is_alive(): self._log_message("Listen thread did not exit quickly.", constants.LOG_LEVEL_WARN)
-            else:
-                self._log_message("Disconnect called from listen thread itself. Not joining.", constants.LOG_LEVEL_DEBUG)
-        self.listen_thread = None; self.client_thread = None; self.gui_queue.put(("disconnect", reason))
-    def _send_disconnect_notification(self, sock, reason):
-         try:
-              sock.settimeout(1.0); command_json = json.dumps({"command": "DISCONNECT", "reason": reason})
-              message_length = len(command_json).to_bytes(4, byteorder='big'); sock.sendall(message_length + command_json.encode('utf-8'))
-              self._log_message("Sent disconnect notification to peer."); time.sleep(0.1)
-         except (OSError, ssl.SSLError, AttributeError) as e: self._log_message(f"Could not notify peer of disconnect (socket error): {e}", constants.LOG_LEVEL_WARN)
-         except Exception as e: self._log_message(f"Unexpected error notifying peer of disconnect: {e}", constants.LOG_LEVEL_WARN)
-         finally: self._close_socket_gracefully(sock)
-    def _close_socket_gracefully(self, sock):
-         if sock:
-              try:
-                  sock.shutdown(socket.SHUT_RDWR)
-              except (OSError, ssl.SSLError):
-                  pass
-              except Exception as e:
-                  self._log_message(f"Error during socket shutdown: {e}", constants.LOG_LEVEL_WARN)
-              try:
-                  sock.close()
-                  self._log_message("Socket closed.")
-              except Exception as e:
-                  self._log_message(f"Error during socket close: {e}", constants.LOG_LEVEL_WARN)
-    def _handle_disconnection_ui(self, reason):
-        self._log_message(f"Handling UI disconnection. Reason: {reason}")
-        self.is_connected = False; self.is_connecting = False; self.client_socket = None; self._reset_transfer_ui()
-        with self.transfer_lock:
-             # is_transferring is reset in _reset_transfer_state
-             if self.is_transferring: self._reset_transfer_state()
-        self._clear_peer_info_display(); self._set_connection_status("Disconnected"); self.root.after(200, self._start_server_if_needed)
-    def _send_command(self, command_dict):
-        sock = self.client_socket
-        if not self.is_connected or sock is None:
-            if command_dict.get("command") != "DISCONNECT": self._log_message("Cannot send command: Not connected.", constants.LOG_LEVEL_ERROR)
-            raise ConnectionError("Not connected")
-        try:
-            command_json = json.dumps(command_dict); encoded_command = command_json.encode('utf-8')
-            message_length = len(encoded_command).to_bytes(4, byteorder='big')
-
-            with self.send_lock: # Acquire lock before socket operation
-                if sock != self.client_socket or not self.is_connected: # Re-check socket validity inside lock
-                    raise ConnectionError("Socket changed or disconnected during send operation.")
-                sock.sendall(message_length + encoded_command)
-
-            log_dict = command_dict.copy()
-            if log_dict.get("command") == "FILE_CHUNK" and 'data' in log_dict:
-                try:
-                    data_len = len(bytes.fromhex(log_dict['data']))
-                    log_dict['data'] = f"<bytes len={data_len}>"
-                except Exception: # Catch potential errors during decoding/len
-                    log_dict['data'] = "<invalid hex data>"
-            elif log_dict.get("command") == "PEER_INFO" and 'fingerprint' in log_dict: log_dict['fingerprint'] = utils.format_fingerprint_display(log_dict['fingerprint'])
-            elif 'data' in log_dict: log_dict['data'] = '<data>'
-            self._log_message(f"Sent command: {log_dict}", constants.LOG_LEVEL_DEBUG)
-        except (ssl.SSLError, socket.error, BrokenPipeError, ConnectionResetError, AttributeError, ValueError) as e: self._log_message(f"Network error sending command ({command_dict.get('command', 'N/A')}): {e}", constants.LOG_LEVEL_ERROR); self._disconnect_peer(reason=f"Network error sending: {e}", notify_peer=False); raise ConnectionError(f"Network error sending command: {e}") from e
-        except Exception as e: self._log_message(f"Unexpected error sending command ({command_dict.get('command', 'N/A')}): {e}", constants.LOG_LEVEL_ERROR); self._disconnect_peer(reason=f"Unexpected send error: {e}", notify_peer=False); raise ConnectionError(f"Unexpected error sending command: {e}") from e
-    def _receive_data(self, sock, length):
-        if not sock: raise ConnectionError("Socket is invalid for receive.")
-        data = b''; start_time = time.time()
-        try:
-            while len(data) < length:
-                 if time.time() - start_time > (constants.HEARTBEAT_TIMEOUT * 1.1): raise socket.timeout("Timeout waiting for data chunk.")
-                 try:
-                     chunk = sock.recv(length - len(data))
-                 except ssl.SSLWantReadError:
-                     time.sleep(0.05)
-                     continue
-                 except socket.timeout:
-                     continue # Let outer timeout handle it
-                 if not chunk: raise ConnectionError("Connection closed by peer while receiving data.")
-                 data += chunk
-            return data
-        except socket.timeout as e: self._log_message(f"Socket timeout receiving data ({e}).", constants.LOG_LEVEL_ERROR); raise ConnectionError("Socket timeout waiting for data.") from e
-        except (ssl.SSLError, socket.error, BrokenPipeError, ConnectionResetError) as e: self._log_message(f"Network error receiving data: {e}", constants.LOG_LEVEL_ERROR); raise ConnectionError(f"Network error receiving data: {e}") from e
-        except Exception as e: self._log_message(f"Unexpected error receiving data: {e}", constants.LOG_LEVEL_ERROR); raise ConnectionError(f"Unexpected error receiving data: {e}") from e
-    def _receive_command(self, sock):
-        if not sock or not self.is_connected: return None
-        json_data = "N/A"
-        try:
-            raw_msglen = self._receive_data(sock, 4);
-            if not raw_msglen: return None
-            msglen = int.from_bytes(raw_msglen, byteorder='big')
-            if not (0 < msglen <= constants.MAX_CMD_LEN): raise ConnectionError(f"Invalid command length received ({msglen}). Max allowed: {constants.MAX_CMD_LEN}")
-            json_data = self._receive_data(sock, msglen).decode('utf-8'); command_dict = json.loads(json_data)
-            log_dict = command_dict.copy()
-            if log_dict.get("command") == "FILE_CHUNK" and 'data' in log_dict:
-                try:
-                    data_len = len(bytes.fromhex(log_dict['data']))
-                    log_dict['data'] = f"<bytes len={data_len}>"
-                except Exception: # Catch potential errors during decoding/len
-                    log_dict['data'] = "<invalid hex data>"
-            elif log_dict.get("command") == "PEER_INFO" and 'fingerprint' in log_dict: log_dict['fingerprint'] = utils.format_fingerprint_display(log_dict['fingerprint'])
-            elif 'data' in log_dict: log_dict['data'] = '<data>'
-            self._log_message(f"Received command type: {log_dict.get('command', 'UNKNOWN')}", constants.LOG_LEVEL_DEBUG); return command_dict
-        except json.JSONDecodeError as e:
-            self._log_message(f"Error decoding JSON command: {e}. Data received: '{json_data[:100]}...'", constants.LOG_LEVEL_ERROR)
-            self._disconnect_peer(reason=f"Protocol error: Invalid JSON received", notify_peer=False)
-            return None
-        except ConnectionError as e:
-            self._log_message(f"Connection error while receiving command: {e}", constants.LOG_LEVEL_INFO)
-            if self.is_connected:
-                self._disconnect_peer(reason=f"Receive error: {e}", notify_peer=False)
-            return None
-        except Exception as e:
-            self._log_message(f"Unexpected error receiving/parsing command: {e}", constants.LOG_LEVEL_ERROR)
-            if self.is_connected:
-                self._disconnect_peer(reason=f"Receive error: {e}", notify_peer=False)
-            return None
-    def _start_listen_thread(self, sock):
-        if self.listen_thread and self.listen_thread.is_alive(): self._log_message("Listen thread already running.", constants.LOG_LEVEL_WARN); return
-        self.listen_thread = threading.Thread(target=self._listen_for_commands, args=(sock,), daemon=True); self.listen_thread.start()
-    def _listen_for_commands(self, sock):
-        self._log_message("Command listening thread started."); self.last_heartbeat_ack_time = time.time()
-        while self.is_connected and self.client_socket == sock:
-            try:
-                 now = time.time()
-                 if now - self.last_heartbeat_ack_time > constants.HEARTBEAT_TIMEOUT: self._log_message(f"Heartbeat timeout ({(now - self.last_heartbeat_ack_time):.1f}s > {constants.HEARTBEAT_TIMEOUT}s). Disconnecting.", constants.LOG_LEVEL_WARN); self._disconnect_peer(reason="Heartbeat timeout", notify_peer=False); break
-                 command = self._receive_command(sock)
-                 if command:
-                     self.last_heartbeat_ack_time = time.time()
-                     try:
-                         self._process_command(command)
-                     except Exception as proc_e:
-                         self._log_message(f"Error processing command '{command.get('command')}': {proc_e}", constants.LOG_LEVEL_ERROR)
-                 elif not self.is_connected:
-                     self._log_message("Listen loop: Detected disconnection.", constants.LOG_LEVEL_INFO)
-                     break
-            except Exception as e:
-                 self._log_message(f"Unexpected error in listen loop: {e}", constants.LOG_LEVEL_ERROR)
-                 if self.is_connected:
-                     self._disconnect_peer(reason=f"Listen loop error: {e}", notify_peer=False)
-                 break
-        self._log_message("Command listening thread stopped.")
-    def _process_command(self, command):
-        cmd_type = command.get("command")
-        try:
-            if cmd_type == "PEER_INFO": peer_host = command.get('hostname', command.get('ip', 'N/A')); self.gui_queue.put(("peer_info", (peer_host, command)))
-            elif cmd_type == "SEND_FILE": self._handle_incoming_file_request(command)
-            elif cmd_type == "ACCEPT_FILE": self._handle_file_accept(command)
-            elif cmd_type == "REJECT_FILE": self._handle_file_reject(command)
-            elif cmd_type == "FILE_CHUNK": self._handle_file_chunk(command)
-            elif cmd_type == "TRANSFER_COMPLETE": self._handle_peer_transfer_complete(command)
-            elif cmd_type == "CANCEL_TRANSFER": self._handle_peer_transfer_cancel(command)
-            elif cmd_type == "DISCONNECT": self._log_message(f"Received disconnect command from peer. Reason: {command.get('reason', 'N/A')}"); disconnect_reason = f"Peer disconnected: {command.get('reason', 'N/A')}"; self.gui_queue.put(("disconnect", disconnect_reason))
-            elif cmd_type == "HEARTBEAT": self._send_command({"command": "HEARTBEAT_ACK"})
-            elif cmd_type == "HEARTBEAT_ACK": self._log_message("Received Heartbeat ACK.", constants.LOG_LEVEL_DEBUG)
-            else: self._log_message(f"Received unknown command: {cmd_type}", constants.LOG_LEVEL_WARN)
-        except Exception as e:
-             self._log_message(f"Error processing command logic for '{cmd_type}': {e}", constants.LOG_LEVEL_ERROR)
-             if cmd_type in ["FILE_CHUNK", "TRANSFER_COMPLETE", "ACCEPT_FILE"]:
-                 self._log_message(f"Cancelling transfer due to processing error.", constants.LOG_LEVEL_ERROR)
-                 self._cancel_transfer(notify_peer=True, reason=f"Receiver processing error: {e}")
-    def _start_heartbeat(self):
-        if not self.is_connected: self._log_message("Cannot start heartbeat: Not connected.", constants.LOG_LEVEL_DEBUG); return
-        if self.heartbeat_timer: self.heartbeat_timer.cancel(); self.heartbeat_timer = None
-        def beat():
-            if self.is_connected and self.client_socket:
-                 try:
-                      self._log_message("Sending Heartbeat.", constants.LOG_LEVEL_DEBUG)
-                      self._send_command({"command": "HEARTBEAT"})
-                      if self.is_connected:
-                          self.heartbeat_timer = threading.Timer(constants.HEARTBEAT_INTERVAL, beat)
-                          self.heartbeat_timer.daemon = True
-                          self.heartbeat_timer.start()
-                      else:
-                          self._log_message("Heartbeat stopping: Disconnected during beat.", constants.LOG_LEVEL_DEBUG)
-                 except ConnectionError:
-                      self._log_message("Heartbeat send failed (connection likely lost).", constants.LOG_LEVEL_WARN)
-                 except Exception as e:
-                      self._log_message(f"Error sending heartbeat: {e}", constants.LOG_LEVEL_ERROR)
-            else:
-                 self._log_message("Heartbeat stopping: No longer connected or socket invalid.", constants.LOG_LEVEL_DEBUG)
-        self._log_message("Starting heartbeat timer."); self.heartbeat_timer = threading.Timer(constants.HEARTBEAT_INTERVAL, beat); self.heartbeat_timer.daemon = True; self.heartbeat_timer.start()
-    def _choose_file(self):
-        if not self.is_connected: self.gui_queue.put(("show_error", "Not connected to a peer.")); return
-        if self.is_transferring: self.gui_queue.put(("show_error", "A file transfer is already in progress.")); return
-        filename = filedialog.askopenfilename(title="Choose File to Send", parent=self.root, initialdir=os.getcwd(), filetypes=[("All files", "*.*")])
-        if filename:
-            try:
-                with open(filename, "rb") as f:
-                    f.read(1)
-                self.file_to_send_path.set(filename)
-                self.send_file_button.config(state='normal')
-                self._log_message(f"Selected file for sending: {os.path.basename(filename)}")
-            except OSError as e:
-                self.gui_queue.put(("show_error", f"Cannot read selected file:\n{filename}\nError: {e}"))
-                self.file_to_send_path.set("")
-                self.send_file_button.config(state='disabled')
-        else:
-            self.file_to_send_path.set("")
-            self.send_file_button.config(state='disabled')
-    def _send_file(self):
-        filepath = self.file_to_send_path.get()
-        if not filepath or not os.path.exists(filepath): self.gui_queue.put(("show_error", "Invalid or non-existent file selected.")); self.file_to_send_path.set(""); self.send_file_button.config(state='disabled'); return
-        try:
-            with open(filepath, "rb") as f:
-                f.read(1)
-        except OSError as e:
-            self.gui_queue.put(("show_error", f"Cannot read file just before sending:\n{filepath}\nError: {e}"))
-            self.file_to_send_path.set("")
-            self.send_file_button.config(state='disabled')
+        """Initiates an outgoing connection to a peer."""
+        if not self.certs_loaded_correctly:
+            self.gui_queue.put(("show_error", "Cannot connect: Certificates not loaded."))
             return
-        if not self.is_connected: self.gui_queue.put(("show_error", "Not connected to a peer.")); return
-        with self.transfer_lock:
-            if self.is_transferring: self.gui_queue.put(("show_error", "A file transfer is already in progress.")); return
-            try:
-                 filesize = os.path.getsize(filepath); filename = os.path.basename(filepath)
-                 self.is_transferring = True; self.transfer_cancelled.clear(); self.current_transfer_id += 1
-                 self.total_file_size = filesize; self.bytes_transferred = 0; self.transfer_start_time = time.time()
-                 self._log_message(f"Requesting to send file: {filename} ({utils.format_bytes(filesize)}) ID: {self.current_transfer_id}")
-                 self.gui_queue.put(("progress", (0, "Speed: Pending...", "ETA: Pending...")))
-                 self.gui_queue.put(("sender_status", ("Requesting...", "blue", False)))
-                 self._update_status_display()
-                 self._send_command({"command": "SEND_FILE", "filename": filename, "filesize": filesize, "transfer_id": self.current_transfer_id})
-                 self._log_message(f"SEND_FILE request sent for ID {self.current_transfer_id}.")
-            except OSError as e:
-                 self._log_message(f"Error accessing file {filepath}: {e}", constants.LOG_LEVEL_ERROR)
-                 self.gui_queue.put(("show_error", f"Error accessing file: {e}"))
-                 self._reset_transfer_state()
-                 self.gui_queue.put(("transfer_cancelled_ui", True))
-            except ConnectionError as e:
-                 self._log_message(f"Connection error starting file transfer: {e}", constants.LOG_LEVEL_ERROR)
-            except Exception as e:
-                 self._log_message(f"Unexpected error starting file transfer: {e}", constants.LOG_LEVEL_ERROR)
-                 self.gui_queue.put(("show_error", f"Unexpected error: {e}"))
-                 self._reset_transfer_state()
-                 self.gui_queue.put(("transfer_cancelled_ui", True))
-    def _handle_file_accept(self, command):
-        transfer_id = command.get("transfer_id")
-        with self.transfer_lock:
-             if not self.is_transferring or transfer_id != self.current_transfer_id or self.receiving_file_handle: self._log_message(f"Received ACCEPT_FILE for wrong/old/receiving transfer ID {transfer_id}. Ignoring.", constants.LOG_LEVEL_WARN); return
-             filepath = self.file_to_send_path.get()
-             if not filepath or not os.path.exists(filepath): self._log_message(f"Cannot start sending for {transfer_id}: File path '{filepath}' missing or invalid.", constants.LOG_LEVEL_ERROR); self._cancel_transfer(notify_peer=True, reason="Sender file disappeared before sending chunks"); return
-             self._log_message(f"Peer accepted file transfer {transfer_id}. Starting send thread for {os.path.basename(filepath)}")
-             self.gui_queue.put(("sender_status", ("Sending...", "blue", False)))
-             send_thread = threading.Thread(target=self._send_file_chunks, args=(filepath, transfer_id), daemon=True); send_thread.start()
-    def _send_file_chunks(self, filepath, transfer_id):
-        sent_successfully = False; bytes_done = 0; total_size = 0
-        try:
-            total_size = os.path.getsize(filepath)
-            with open(filepath, "rb") as f:
-                 while True:
-                     if self.transfer_cancelled.is_set() or not self.is_connected: self._log_message(f"Stopping file send thread for {transfer_id} (cancelled/disconnected).", constants.LOG_LEVEL_INFO); break
-                     chunk = f.read(constants.BUFFER_SIZE)
-                     if not chunk:
-                         if bytes_done == total_size: sent_successfully = True
-                         else: self._log_message(f"File send {transfer_id}: Read finished but size mismatch (read {bytes_done}, expected {total_size}).", constants.LOG_LEVEL_WARN)
-                         break
-                     if self.transfer_cancelled.is_set() or not self.is_connected: break
-                     self._send_command({"command": "FILE_CHUNK", "transfer_id": transfer_id, "data": chunk.hex()})
-                     bytes_done += len(chunk)
-                     with self.transfer_lock:
-                          if transfer_id != self.current_transfer_id or not self.is_transferring: self._log_message(f"Transfer ID changed during send ({transfer_id} vs {self.current_transfer_id}). Stopping send thread.", constants.LOG_LEVEL_WARN); sent_successfully = False; break
-                          self.bytes_transferred = bytes_done; current_bytes_done = self.bytes_transferred; current_total_size = self.total_file_size; start_time = self.transfer_start_time
-                     now = time.time(); elapsed = now - start_time
-                     if elapsed > 0.5 or (current_bytes_done > 0 and current_bytes_done % (constants.BUFFER_SIZE * 10) == 0) or current_bytes_done == current_total_size:
-                         progress = (current_bytes_done / current_total_size) * 100 if current_total_size > 0 else 100
-                         speed_bps = current_bytes_done / elapsed if elapsed > 0 else 0; speed_str = f"Speed: {utils.format_bytes(int(speed_bps))}/s"
-                         eta = ((current_total_size - current_bytes_done) / speed_bps) if speed_bps > 0 and current_bytes_done < current_total_size else 0
-                         eta_str = f"ETA: {int(eta // 60)}m {int(eta % 60)}s" if eta > 0 else "ETA: ..."; self.gui_queue.put(("progress", (progress, speed_str, eta_str)))
-            with self.transfer_lock: is_still_current_transfer = (transfer_id == self.current_transfer_id and self.is_transferring)
-            if is_still_current_transfer and not self.transfer_cancelled.is_set() and self.is_connected:
-                 if sent_successfully:
-                     self._log_message(f"Finished sending file {transfer_id} ({utils.format_bytes(bytes_done)}). Notifying peer.")
-                     self._send_command({"command": "TRANSFER_COMPLETE", "transfer_id": transfer_id, "filename": os.path.basename(filepath)})
-                     self.gui_queue.put(("sender_status", ("Transfer Completed!", "green", True)))
-                     self.gui_queue.put(("transfer_complete", True))
-                 else:
-                     self._log_message(f"File send {transfer_id} stopped unexpectedly or size mismatch. Sent {bytes_done}/{total_size} bytes.", constants.LOG_LEVEL_ERROR)
-                     self.gui_queue.put(("transfer_cancelled_ui", True))
-                     if self.is_connected:
-                         self._cancel_transfer(notify_peer=True, reason="Sender error or size mismatch")
-        except FileNotFoundError:
-             self._log_message(f"File not found during send: {filepath}", constants.LOG_LEVEL_ERROR)
-             self.gui_queue.put(("show_error", f"File disappeared during transfer: {filepath}"))
-             with self.transfer_lock:
-                  if transfer_id == self.current_transfer_id and self.is_transferring: self._cancel_transfer(notify_peer=True, reason="Sender file disappeared")
-        except (ConnectionError, ssl.SSLError, socket.error) as e:
-             self._log_message(f"Network error sending file chunk for {transfer_id}: {e}", constants.LOG_LEVEL_ERROR)
-             with self.transfer_lock:
-                  if transfer_id == self.current_transfer_id and self.is_transferring: self.gui_queue.put(("transfer_cancelled_ui", True))
-        except Exception as e:
-             self._log_message(f"Unexpected error sending file chunks for {transfer_id}: {e}", constants.LOG_LEVEL_ERROR)
-             self.gui_queue.put(("show_error", f"Error during file send: {e}"))
-             with self.transfer_lock:
-                  if transfer_id == self.current_transfer_id and self.is_transferring: self._cancel_transfer(notify_peer=True, reason=f"Sender error: {e}")
-    def _schedule_sender_status_clear(self):
-        if self.sender_status_clear_timer: self.sender_status_clear_timer.cancel()
-        def clear_status():
-             if self.root.winfo_exists():
-                  if not self.is_transferring: self.gui_queue.put(("sender_status", ("", "blue", False)))
-             self.sender_status_clear_timer = None
-        self.sender_status_clear_timer = threading.Timer(constants.SENDER_STATUS_DISPLAY_DURATION / 1000.0, clear_status); self.sender_status_clear_timer.daemon = True; self.sender_status_clear_timer.start()
-    def _handle_file_reject(self, command):
-        transfer_id = command.get("transfer_id")
-        with self.transfer_lock:
-            if not self.is_transferring or transfer_id != self.current_transfer_id or self.receiving_file_handle: self._log_message(f"Received REJECT_FILE for wrong/old/receiving transfer ID {transfer_id}. Ignoring.", constants.LOG_LEVEL_WARN); return
-            reason = command.get("reason", "No reason given"); self._log_message(f"Peer rejected file transfer {transfer_id}. Reason: {reason}", constants.LOG_LEVEL_WARN)
-            self.gui_queue.put(("show_info", f"Peer rejected the file transfer.\nReason: {reason}")); self._reset_transfer_state(); self.gui_queue.put(("transfer_cancelled_ui", True))
-    def _handle_incoming_file_request(self, command):
-        filename = command.get("filename", "unknown_file"); filesize = command.get("filesize", 0); transfer_id = command.get("transfer_id")
-        if not transfer_id or not filename or filesize < 0: self._log_message(f"Received invalid file request (id:{transfer_id}, name:{filename}, size:{filesize}). Ignoring.", constants.LOG_LEVEL_ERROR); return
-        with self.transfer_lock:
-            if self.is_transferring:
-                self._log_message("Received file request while another transfer is active. Rejecting.", constants.LOG_LEVEL_WARN)
-                try:
-                    self._send_command({"command": "REJECT_FILE", "transfer_id": transfer_id, "reason": "Another transfer is in progress."})
-                except ConnectionError:
-                    self._log_message("Connection error trying to reject busy transfer.", constants.LOG_LEVEL_WARN)
-                except Exception as e:
-                    self._log_message(f"Error sending busy rejection: {e}", constants.LOG_LEVEL_WARN)
-                return
-            self._pending_transfer_request = {"id": transfer_id, "filename": filename, "filesize": filesize}; self._log_message(f"Incoming file request: {filename} ({utils.format_bytes(filesize)}) ID: {transfer_id}")
-            self.gui_queue.put(("ask_yes_no", (transfer_id, filename, utils.format_bytes(filesize))))
-    def _respond_to_file_request(self, accept, transfer_id, filename):
-        pending_request = getattr(self, '_pending_transfer_request', None)
-        if not pending_request or pending_request["id"] != transfer_id: self._log_message(f"No matching pending request found for ID {transfer_id} response.", constants.LOG_LEVEL_WARN); return
-        delattr(self, '_pending_transfer_request'); filesize = pending_request["filesize"]
-        if accept:
-            with self.transfer_lock:
-                 if self.is_transferring:
-                      self._log_message(f"Transfer started while user was deciding on {transfer_id}. Rejecting.", constants.LOG_LEVEL_WARN)
-                      try:
-                          self._send_command({"command": "REJECT_FILE", "transfer_id": transfer_id, "reason": "Another transfer started."})
-                      except ConnectionError:
-                          pass
-                      except Exception as e:
-                          self._log_message(f"Error sending late rejection: {e}", constants.LOG_LEVEL_WARN)
-                      return
-                 downloads_dir = utils.get_downloads_folder()
-                 safe_filename = "".join(c for c in filename if c.isalnum() or c in (' ', '.', '_', '-')).strip()
-                 if not safe_filename: safe_filename = f"downloaded_file_{transfer_id}"
-                 base, ext = os.path.splitext(safe_filename); counter = 1; temp_receiving_path = os.path.join(downloads_dir, f"{base}{ext}")
-                 while os.path.exists(temp_receiving_path): temp_receiving_path = os.path.join(downloads_dir, f"{base}_{counter}{ext}"); counter += 1
-                 self.receiving_file_path = temp_receiving_path
-                 try:
-                      self.receiving_file_handle = open(self.receiving_file_path, "wb")
-                      self.is_transferring = True; self.transfer_cancelled.clear(); self.current_transfer_id = transfer_id
-                      self.total_file_size = filesize; self.bytes_transferred = 0; self.transfer_start_time = time.time()
-                      self._log_message(f"User accepted transfer {transfer_id}. Saving to {os.path.basename(self.receiving_file_path)}")
-                      self.gui_queue.put(("progress", (0, "Speed: Starting...", "ETA: Starting..."))); self._update_status_display()
-                      self._send_command({"command": "ACCEPT_FILE", "transfer_id": transfer_id})
-                 except OSError as e:
-                      self._log_message(f"Error opening file for receiving {self.receiving_file_path}: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Cannot write to target folder: {e}"))
-                      if self.receiving_file_handle: self.receiving_file_handle.close(); self.receiving_file_handle = None
-                      self._reset_transfer_state(); self.gui_queue.put(("transfer_cancelled_ui", False))
-                      try:
-                          self._send_command({"command": "REJECT_FILE", "transfer_id": transfer_id, "reason": f"Receiver cannot write file: {e}"})
-                      except ConnectionError:
-                          pass
-                      except Exception as e_rej:
-                          self._log_message(f"Error sending reject after write fail: {e_rej}", constants.LOG_LEVEL_WARN)
-                 except ConnectionError as e:
-                      self._log_message(f"Connection error accepting file transfer: {e}", constants.LOG_LEVEL_ERROR)
-                      if self.receiving_file_handle: self.receiving_file_handle.close(); self.receiving_file_handle = None
-                 except Exception as e:
-                      self._log_message(f"Unexpected error accepting transfer {transfer_id}: {e}", constants.LOG_LEVEL_ERROR)
-                      if self.receiving_file_handle: self.receiving_file_handle.close(); self.receiving_file_handle = None
-                      self._reset_transfer_state(); self.gui_queue.put(("transfer_cancelled_ui", False))
-                      try:
-                          self._send_command({"command": "REJECT_FILE", "transfer_id": transfer_id, "reason": f"Receiver error: {e}"})
-                      except ConnectionError:
-                          pass
-                      except Exception as e_rej:
-                          self._log_message(f"Error sending reject after setup fail: {e_rej}", constants.LOG_LEVEL_WARN)
-        else:
-            self._log_message(f"User rejected file transfer {transfer_id}.")
-            try: self._send_command({"command": "REJECT_FILE", "transfer_id": transfer_id, "reason": "User rejected."})
-            except ConnectionError: self._log_message("Connection error sending REJECT_FILE.", constants.LOG_LEVEL_WARN)
-            except Exception as e: self._log_message(f"Error sending reject file cmd: {e}", constants.LOG_LEVEL_WARN)
-    def _handle_file_chunk(self, command):
-        transfer_id = command.get("transfer_id"); hex_data = command.get("data"); cancel_needed = False; cancel_reason = ""
-        if not hex_data: self._log_message("Received empty file chunk data.", constants.LOG_LEVEL_WARN); return
-        try: chunk_data = bytes.fromhex(hex_data); chunk_len = len(chunk_data)
-        except (TypeError, ValueError) as e: self._log_message(f"Error decoding hex data for chunk {transfer_id}: {e}. Cancelling.", constants.LOG_LEVEL_ERROR); self._cancel_transfer(notify_peer=True, reason="Receiver received corrupt data"); return
-        with self.transfer_lock:
-            if not self.is_transferring or transfer_id != self.current_transfer_id or not self.receiving_file_handle:
-                 if not self.transfer_cancelled.is_set(): self._log_message(f"Received unexpected/outdated FILE_CHUNK for ID {transfer_id}. Ignoring.", constants.LOG_LEVEL_WARN)
-                 return
-            try:
-                 if (self.bytes_transferred + chunk_len) > self.total_file_size and self.total_file_size > 0:
-                      self._log_message(f"Received chunk for {transfer_id} exceeds expected file size ({self.bytes_transferred + chunk_len} > {self.total_file_size}). Truncating and cancelling.", constants.LOG_LEVEL_WARN)
-                      bytes_to_write = self.total_file_size - self.bytes_transferred
-                      if bytes_to_write > 0: self.receiving_file_handle.write(chunk_data[:bytes_to_write]); self.bytes_transferred += bytes_to_write
-                      cancel_needed = True; cancel_reason = "Received excess data from peer"
-                 else: self.receiving_file_handle.write(chunk_data); self.bytes_transferred += chunk_len
-                 bytes_done = self.bytes_transferred; total_size = self.total_file_size; start_time = self.transfer_start_time
-                 now = time.time(); elapsed = now - start_time
-                 if elapsed > 0.5 or (bytes_done > 0 and bytes_done % (constants.BUFFER_SIZE * 10) == 0) or (total_size > 0 and bytes_done == total_size):
-                     progress = (bytes_done / total_size) * 100 if total_size > 0 else 100
-                     speed_bps = bytes_done / elapsed if elapsed > 0 else 0; speed_str = f"Speed: {utils.format_bytes(int(speed_bps))}/s"
-                     eta = ((total_size - bytes_done) / speed_bps) if speed_bps > 0 and bytes_done < total_size else 0
-                     eta_str = f"ETA: {int(eta // 60)}m {int(eta % 60)}s" if eta > 0 and total_size > 0 else "ETA: ..."
-                     self.gui_queue.put(("progress", (progress, speed_str, eta_str)))
-            except OSError as e: self._log_message(f"Error writing received file chunk for {transfer_id}: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Error writing received file: {e}")); cancel_needed = True; cancel_reason = f"Receiver write error: {e}"
-            except Exception as e: self._log_message(f"Unexpected error handling file chunk for {transfer_id}: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Unexpected error receiving file: {e}")); cancel_needed = True; cancel_reason = f"Receiver unexpected error: {e}"
-        if cancel_needed: self._cancel_transfer(notify_peer=True, reason=cancel_reason)
-    def _handle_peer_transfer_complete(self, command):
-        transfer_id = command.get("transfer_id"); filename = command.get("filename", "unknown_file"); success = False; display_name = "N/A"; final_path = "N/A"
-        with self.transfer_lock:
-            if not self.is_transferring or transfer_id != self.current_transfer_id or not self.receiving_file_handle:
-                 if not self.transfer_cancelled.is_set(): self._log_message(f"Received unexpected/outdated TRANSFER_COMPLETE for ID {transfer_id}. Ignoring.", constants.LOG_LEVEL_WARN)
-                 return
-            self._log_message(f"Peer completed sending file transfer {transfer_id} ({filename}). Verifying size."); final_path = self.receiving_file_path
-            try: self.receiving_file_handle.close(); self.receiving_file_handle = None
-            except Exception as e: self._log_message(f"Error closing received file handle: {e}", constants.LOG_LEVEL_WARN); self.gui_queue.put(("show_error", f"Error closing file '{filename}': {e}")); self.gui_queue.put(("transfer_cancelled_ui", False)); self._reset_transfer_state(); self._cleanup_partial_file(final_path); return
-            final_size = self.bytes_transferred; expected_size = self.total_file_size
-            if (expected_size == 0 and final_size == 0) or (expected_size > 0 and final_size == expected_size): success = True
-            if success: self._log_message(f"File '{os.path.basename(final_path)}' received successfully ({utils.format_bytes(final_size)})."); display_name = os.path.basename(final_path); self.received_files[display_name] = final_path
-            else: self._log_message(f"File transfer {transfer_id} size mismatch! Expected {expected_size}, got {final_size}.", constants.LOG_LEVEL_ERROR)
-            self._reset_transfer_state()
-        if success: self.gui_queue.put(("show_info", f"File '{display_name}' received successfully.")); self.gui_queue.put(("add_received_file", (display_name, final_path))); self.gui_queue.put(("transfer_complete", False))
-        else: self.gui_queue.put(("show_error", f"File transfer failed: Size mismatch for '{filename}'. Expected {utils.format_bytes(expected_size)}, received {utils.format_bytes(final_size)}.")); self._cleanup_partial_file(final_path); self.gui_queue.put(("transfer_cancelled_ui", False))
-    def _cancel_transfer(self, notify_peer=True, reason="User cancelled"):
-        current_transfer_id = -1; is_sender = False; partial_file_path = None
-        with self.transfer_lock:
-            if not self.is_transferring: return
-            if self.transfer_cancelled.is_set(): return
-            self._log_message(f"Initiating cancel for transfer ID {self.current_transfer_id}. Reason: {reason}"); self.transfer_cancelled.set()
-            current_transfer_id = self.current_transfer_id; is_sender = self.receiving_file_handle is None
-            if self.sender_status_clear_timer: self.sender_status_clear_timer.cancel(); self.sender_status_clear_timer = None; self._log_message("Sender status clear timer cancelled.")
-            if self.receiving_file_handle:
-                try:
-                    self.receiving_file_handle.close()
-                except Exception as e:
-                    self._log_message(f"Error closing receiving file handle during cancel: {e}", constants.LOG_LEVEL_WARN)
-            partial_file_path = self.receiving_file_path if not is_sender else None; self._reset_transfer_state()
-        if partial_file_path: self._cleanup_partial_file(partial_file_path)
-        if notify_peer and self.is_connected and current_transfer_id != -1: threading.Thread(target=self._send_cancel_notification, args=(current_transfer_id,), daemon=True).start()
-        self.gui_queue.put(("transfer_cancelled_ui", is_sender))
-    def _send_cancel_notification(self, transfer_id):
-         if self.is_connected:
-              try: self._send_command({"command": "CANCEL_TRANSFER", "transfer_id": transfer_id}); self._log_message(f"Sent cancellation notice to peer for transfer {transfer_id}.")
-              except ConnectionError: self._log_message("Could not notify peer of cancellation (connection lost).", constants.LOG_LEVEL_WARN)
-              except Exception as e: self._log_message(f"Error sending cancellation notice: {e}", constants.LOG_LEVEL_ERROR)
-    def _handle_peer_transfer_cancel(self, command):
-        transfer_id = command.get("transfer_id"); partial_file_path = None; is_sender = False
-        with self.transfer_lock:
-            if not self.is_transferring or transfer_id != self.current_transfer_id:
-                 if not self.transfer_cancelled.is_set(): self._log_message(f"Received CANCEL_TRANSFER for wrong/old transfer ID {transfer_id}. Ignoring.", constants.LOG_LEVEL_WARN)
-                 return
-            if self.transfer_cancelled.is_set(): return
-            self._log_message(f"Peer cancelled file transfer {transfer_id}.", constants.LOG_LEVEL_WARN); self.transfer_cancelled.set()
-            if self.sender_status_clear_timer: self.sender_status_clear_timer.cancel(); self.sender_status_clear_timer = None; self._log_message("Sender status clear timer cancelled due to peer cancellation.")
-            is_sender = self.receiving_file_handle is None; partial_file_path = self.receiving_file_path if not is_sender else None
-            if self.receiving_file_handle:
-                try:
-                    self.receiving_file_handle.close()
-                except Exception:
-                    pass
-            self._reset_transfer_state()
-        if partial_file_path: self._cleanup_partial_file(partial_file_path)
-        self.gui_queue.put(("transfer_cancelled_ui", is_sender)); self.gui_queue.put(("show_info", "Peer cancelled the file transfer."))
-    def _cleanup_partial_file(self, file_path):
-         if file_path and os.path.exists(file_path):
-              try: os.remove(file_path); self._log_message(f"Removed partially received file: {os.path.basename(file_path)}")
-              except OSError as e: self._log_message(f"Error removing partially received file {os.path.basename(file_path)}: {e}", constants.LOG_LEVEL_ERROR)
-    def _reset_transfer_state(self):
-        self.is_transferring = False; self.file_to_send_path.set("")
-        self.bytes_transferred = 0; self.total_file_size = 0; self.transfer_start_time = 0
-        if self.receiving_file_handle:
-            try:
-                self.receiving_file_handle.close()
-            except Exception:
-                pass # Ignore errors on close during reset
-        self.receiving_file_handle = None; self.receiving_file_path = None; self.sender_transfer_status.set("")
-        if self.sender_status_clear_timer: self.sender_status_clear_timer.cancel(); self.sender_status_clear_timer = None
-    def _reset_transfer_ui(self):
-        self.gui_queue.put(("progress", (0, "Speed: N/A", "ETA: N/A"))); self.gui_queue.put(("sender_status", ("", "blue", False)))
-    def _update_progress_display(self, progress, speed, eta):
-        if not self.root.winfo_exists(): return
-        try: safe_progress = max(0.0, min(100.0, progress)); self.transfer_progress.set(safe_progress); self.transfer_speed.set(speed); self.transfer_eta.set(eta)
-        except tk.TclError as e: print(f"Error updating progress display (window likely closing): {e}")
-    def _update_sender_status(self, status_text, color="blue", temporary=False):
-         if not self.root.winfo_exists(): return
-         try:
-              if self.sender_status_clear_timer: self.sender_status_clear_timer.cancel(); self.sender_status_clear_timer = None
-              self.sender_status_label.config(foreground=color); self.sender_transfer_status.set(status_text)
-              if temporary and status_text: self._schedule_sender_status_clear()
-         except tk.TclError as e: print(f"Error updating sender status (window likely closing): {e}")
-    def _handle_transfer_complete_ui(self, is_sender):
-        self._log_message(f"Transfer complete UI update (Sender={is_sender}).")
-        with self.transfer_lock:
-             if self.is_transferring: self._reset_transfer_state()
-        self._reset_transfer_ui(); self._update_status_display()
-    def _handle_transfer_cancelled_ui(self, is_sender):
-        self._log_message(f"Transfer cancelled UI update (Sender={is_sender}).")
-        self._reset_transfer_ui(); self._update_status_display()
-    def _add_received_file_display(self, display_name, full_path):
-        if not self.root.winfo_exists(): return
-        try:
-             if display_name not in self.received_listbox.get(0, tk.END): self.received_listbox.insert(tk.END, display_name)
-             self.received_files[display_name] = full_path
-        except tk.TclError as e: print(f"Error adding received file to listbox (window likely closing): {e}")
-    def _open_received_file(self, event=None):
-        try:
-             selected_indices = self.received_listbox.curselection()
-             if not selected_indices: return
-             selected_display_name = self.received_listbox.get(selected_indices[0])
-             file_path = self.received_files.get(selected_display_name)
-             if file_path: self._log_message(f"Attempting to open received file: {file_path}"); utils.open_file_in_default_app(file_path)
-             else: self._log_message(f"Cannot open received file: Path not found for '{selected_display_name}'.", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Internal error: Path not found for '{selected_display_name}'."))
-        except tk.TclError as e: print(f"Error opening received file (window likely closing): {e}")
-
-    # --- Logging GUI ---
-    # Removed _toggle_logs method
-
-    def _copy_logs(self):
-        if not self.root.winfo_exists(): return
-        try:
-            log_content = self.log_text.get("1.0", tk.END).strip()
-            if log_content:
-                self.root.clipboard_clear()
-                self.root.clipboard_append(log_content)
-                self._log_message("Logs copied to clipboard.")
-                self._visual_feedback(self.copy_log_button, "Copy", "Copied!")
-            else:
-                self._log_message("No logs to copy.", constants.LOG_LEVEL_INFO)
-        except Exception as e: self._log_message(f"Error copying logs: {e}", constants.LOG_LEVEL_ERROR); self.gui_queue.put(("show_error", f"Could not copy logs: {e}"))
-    def _clear_logs(self):
-        if not self.root.winfo_exists(): return
-        try:
-            self.log_text.config(state='normal')
-            self.log_text.delete("1.0", tk.END)
-            self.log_text.config(state='disabled')
-            self._log_message("Logs cleared.")
-            self._visual_feedback(self.clear_log_button, "Clear", "Cleared!")
-        except tk.TclError as e: print(f"Error clearing logs (window likely closing): {e}")
-
-    # --- Admin Tools ---
-    def _open_admin_tools(self):
-        # --- This function is no longer used, logic moved to _create_widgets and _show_admin_tools_view ---
-        if self.admin_tools_window and self.admin_tools_window.winfo_exists():
-            self.admin_tools_window.lift()
+        if self.is_connected or self.is_connecting:
+            self.gui_queue.put(("show_error", "Already connected or attempting to connect."))
             return
 
-        self.admin_tools_window = tk.Toplevel(self.root)
-        self.admin_tools_window.title("Admin Tools")
-        self.admin_tools_window.geometry("500x400")
-        self.admin_tools_window.resizable(False, True)
-        self.admin_tools_window.transient(self.root) # Keep it on top of the main window
+        peer_host = self.peer_ip_hostname.get().strip()
+        if not peer_host:
+            self.gui_queue.put(("show_error", "Peer IP/Hostname cannot be empty."))
+            return
 
-        # --- Admin Window Widgets ---
-        admin_frame = ttk.Frame(self.admin_tools_window, padding="10")
-        admin_frame.pack(fill=tk.BOTH, expand=True)
-        admin_frame.columnconfigure(0, weight=1) # Allow content to expand horizontally
-        # admin_frame.rowconfigure(2, weight=1) # No longer needed for log area
+        self.is_connecting = True
+        self.gui_queue.put(("status", "Connecting"))
+        self.gui_queue.put(("clear_peer_info", None)) # Clear previous peer info
 
-        # CA Section
-        ca_frame = ttk.LabelFrame(admin_frame, text="Certificate Authority (CA)", padding="10")
-        ca_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
-        ca_frame.columnconfigure(1, weight=1)
+        # Run connection in a separate thread to keep GUI responsive
+        self.client_connection_thread = threading.Thread(target=self._initiate_connection, args=(peer_host,), daemon=True)
+        self.client_connection_thread.start()
 
-        self.admin_ca_status_var = tk.StringVar(value="CA Status: Unknown")
-        ttk.Label(ca_frame, textvariable=self.admin_ca_status_var).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2)
-        self.admin_load_ca_button = ttk.Button(ca_frame, text="Load/Create CA", command=self._admin_load_create_ca)
-        self.admin_load_ca_button.grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+    def _initiate_connection(self, peer_host):
+        """Core logic for establishing an outgoing TLS connection."""
+        self.ssl_context = self._create_ssl_context(purpose=ssl.Purpose.SERVER_AUTH)
+        if not self.ssl_context:
+            self._log_message("Client connection failed: Could not create SSL context.", constants.LOG_LEVEL_ERROR)
+            self.is_connecting = False
+            self.gui_queue.put(("status", "SSL Error"))
+            return
 
-        ca_button_frame = ttk.Frame(ca_frame)
-        ca_button_frame.grid(row=1, column=1, sticky=tk.E, padx=5, pady=5)
-        self.admin_export_ca_button = ttk.Button(ca_button_frame, text="Export CA...", command=self._admin_export_ca, state='disabled')
-        self.admin_export_ca_button.pack(side=tk.LEFT, padx=(0, 5))
-        self.admin_clear_ca_button = ttk.Button(ca_button_frame, text="Clear CA", command=self._admin_clear_ca, state='disabled')
-        self.admin_clear_ca_button.pack(side=tk.LEFT)
+        raw_socket = None
+        try:
+            raw_socket = socket.create_connection((peer_host, constants.DEFAULT_PORT), timeout=constants.CONNECTION_TIMEOUT)
+            self.client_socket = self.ssl_context.wrap_socket(raw_socket, server_hostname=peer_host) # server_hostname for SNI
+            self._log_message(f"Successfully connected and SSL handshake complete with {peer_host}.", constants.LOG_LEVEL_DEBUG)
 
-        # Client Bundle Section
-        client_frame = ttk.LabelFrame(admin_frame, text="Generate Client Bundle (.clb)", padding="10")
-        client_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
-        client_frame.columnconfigure(1, weight=1)
+            # Exchange peer info
+            peer_cert = self.client_socket.getpeercert(binary_form=True)
+            if not peer_cert:
+                raise ssl.SSLError("Could not get peer certificate.")
+            self.peer_full_fingerprint = hashlib.sha256(peer_cert).hexdigest()
+            peer_fp_display = utils.format_fingerprint_display(self.peer_full_fingerprint)
 
-        ttk.Label(client_frame, text="Client Name (CN):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
-        self.admin_client_cn_var = tk.StringVar()
-        self.admin_client_cn_entry = ttk.Entry(client_frame, textvariable=self.admin_client_cn_var, width=30)
-        self.admin_client_cn_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
+            # Receive peer's info first (server sends first)
+            peer_info_cmd = self._receive_command(self.client_socket)
+            if not peer_info_cmd or peer_info_cmd.get("type") != "PEER_INFO":
+                raise ConnectionError("Failed to receive peer info or malformed command.")
+            self.gui_queue.put(("peer_info", (peer_host, peer_info_cmd["data"]))) # Pass peer_host for display consistency
 
-        self.admin_generate_bundle_button = ttk.Button(client_frame, text="Generate Bundle", command=self._admin_generate_bundle, state='disabled')
-        self.admin_generate_bundle_button.grid(row=1, column=0, columnspan=2, padx=5, pady=5)
+            # Send our info
+            local_info = self._get_local_peer_info()
+            self._send_command(self.client_socket, {"type": "PEER_INFO", "data": local_info})
 
-        # --- Removed Admin Log Section ---
+            # Fingerprint verification dialog
+            verification_event = threading.Event()
+            user_accepted = None
+            def set_verification_result(accepted):
+                nonlocal user_accepted
+                user_accepted = accepted
+                verification_event.set()
 
-        # Close Button
-        # Adjusted row index from 3 to 2 since log section is removed
-        close_button = ttk.Button(admin_frame, text="Close", command=self.admin_tools_window.destroy)
-        close_button.grid(row=3, column=0, sticky=tk.E, pady=(10, 0), padx=5)
+            self.gui_queue.put(("status", "Confirming Peer"))
+            self.gui_queue.put(("prompt_fingerprint", (peer_fp_display, set_verification_result)))
+            verification_event.wait(timeout=constants.CONFIRMATION_TIMEOUT)
 
-        # Initial CA check
-        self._admin_check_ca_status()
-
-    def _admin_log(self, message):
-        self._log_message(f"[Admin] {message}", constants.LOG_LEVEL_INFO) # Also log to main window
-
-    def _admin_check_ca_status(self):
-        """Checks keyring for CA and updates Admin Tools UI elements."""
-        self.admin_ca_cert, self.admin_ca_key, msg = utils.get_ca_from_keyring()
-        if self.admin_ca_cert and self.admin_ca_key:
-            # Update widgets directly, no need to check if window exists
-            self.admin_ca_status_var.set("CA Status: Loaded from Keyring")
-            self.admin_generate_bundle_button.config(state='normal')
-            self.admin_export_ca_button.config(state='normal')
-            self.admin_clear_ca_button.config(state='normal')
-            self._log_message("[Admin] CA loaded successfully from keyring.", constants.LOG_LEVEL_INFO)
-        else:
-            self.admin_ca_status_var.set("CA Status: Not Found")
-            # Check if admin_tools_frame exists before configuring buttons
-            if hasattr(self, 'admin_tools_frame') and self.admin_tools_frame.winfo_exists():
-                self.admin_generate_bundle_button.config(state='disabled')
-                self.admin_export_ca_button.config(state='disabled')
-                self.admin_clear_ca_button.config(state='disabled')
-            self._log_message(f"[Admin] CA not found in keyring: {msg}", constants.LOG_LEVEL_INFO)
-
-    def _admin_load_create_ca(self):
-        self._admin_check_ca_status() # Re-check first
-        if not self.admin_ca_cert:
-            if messagebox.askyesno("Create CA?", "No CA found in the system keyring.\n\nDo you want to create a new CA certificate and key and store them securely?", parent=self.root): # Use self.root as parent
-                self._admin_log("Attempting to create and store new CA...")
-                # Prompt for CA details
-                ca_details = self._prompt_ca_details()
-                if not ca_details:
-                    self._log_message("[Admin] CA creation cancelled by user (details dialog).", constants.LOG_LEVEL_INFO)
-                    return
-                success, msg = utils.create_and_store_ca(ca_details)
-                if success:
-                    self._log_message(f"[Admin] CA creation successful: {msg}", constants.LOG_LEVEL_INFO)
-                    messagebox.showinfo("CA Created", "New CA certificate and key created and stored in your system keyring.", parent=self.root) # Use self.root as parent
-                    self._admin_check_ca_status() # Update status after creation
+            if user_accepted is None: # Timeout
+                self._log_message("Peer fingerprint confirmation timed out.", constants.LOG_LEVEL_WARN)
+                self._send_command(self.client_socket, {"type": "VERIFICATION_REJECTED", "reason": "Timeout"})
+                raise ConnectionRefusedError("Fingerprint confirmation timed out.")
+            elif user_accepted:
+                self._log_message("Peer fingerprint accepted by user.", constants.LOG_LEVEL_INFO)
+                self._send_command(self.client_socket, {"type": "VERIFICATION_ACCEPTED"})
+                # Wait for server's final confirmation (it might have also timed out or rejected)
+                server_response = self._receive_command(self.client_socket) # Client waits for server's acceptance
+                if server_response and server_response.get("type") == "VERIFICATION_ACCEPTED":
+                    self.is_connected = True
+                    self._log_message(f"CLIENT_INITIATE: Socket timeout before set to None: {self.client_socket.gettimeout()}", constants.LOG_LEVEL_DEBUG)
+                    self.client_socket.settimeout(None) # Ensure blocking reads for comms loop
+                    self.is_connecting = False
+                    self.gui_queue.put(("status", "Securely Connected"))
+                    self._start_heartbeat()
+                    self._communication_loop()
                 else:
-                    self._log_message(f"[Admin] CA creation failed: {msg}", constants.LOG_LEVEL_ERROR)
-                    messagebox.showerror("CA Creation Failed", f"Could not create or store the CA:\n{msg}", parent=self.root) # Use self.root as parent
-            else:
-                self._log_message("[Admin] User chose not to create a new CA.", constants.LOG_LEVEL_INFO)
-        else:
-            messagebox.showinfo("CA Loaded", "CA is already loaded from the keyring.", parent=self.root) # Use self.root as parent
+                    reason = server_response.get("reason", "Server rejected connection") if server_response else "No response from server"
+                    self._log_message(f"Connection rejected by peer: {reason}", constants.LOG_LEVEL_WARN)
+                    self.gui_queue.put(("show_warning", f"Connection rejected by peer: {reason}"))
+                    raise ConnectionRefusedError(f"Peer rejected: {reason}")
+            else: # User rejected
+                self._log_message("Peer fingerprint rejected by user.", constants.LOG_LEVEL_WARN)
+                self._send_command(self.client_socket, {"type": "VERIFICATION_REJECTED", "reason": "User rejected"})
+                raise ConnectionRefusedError("Fingerprint rejected by user.")
 
-    def _prompt_ca_details(self):
-        """Opens a dialog to collect CA subject details."""
-        # Use self.root as parent for the dialog
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Enter CA Details")
-        dialog.transient(self.root) # Make transient to root
-        dialog.grab_set()
-        dialog.resizable(False, False)
+        except (socket.timeout, socket.error) as e:
+            self._log_message(f"Connection to {peer_host} failed: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"Could not connect to {peer_host}:\n{e}"))
+        except (ssl.SSLError, ConnectionError, ConnectionRefusedError, json.JSONDecodeError) as e:
+            self._log_message(f"Connection to {peer_host} failed during setup: {e}", constants.LOG_LEVEL_ERROR)
+            # Error message already shown for ConnectionRefusedError if it's specific
+            if not isinstance(e, ConnectionRefusedError) or "Fingerprint" not in str(e):
+                 self.gui_queue.put(("show_error", f"Connection to {peer_host} failed:\n{e}"))
+        except Exception as e: # Catch any other unexpected error
+            self._log_message(f"Unexpected error connecting to {peer_host}: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"An unexpected error occurred:\n{e}"))
+        finally:
+            if not self.is_connected:
+                if self.client_socket: self.client_socket.close()
+                elif raw_socket: raw_socket.close() # Close raw socket if SSL wrapping failed or didn't happen
+                self.client_socket = None
+                self.is_connecting = False
+                self.gui_queue.put(("clear_peer_info", None))
+                if self.certs_loaded_correctly: self.gui_queue.put(("status", "Disconnected"))
+                else: self.gui_queue.put(("status", "No Certs"))
 
-        details = {}
-        frame = ttk.Frame(dialog, padding="10")
-        frame.pack(expand=True, fill="both")
-
-        # Reordered fields as requested
-        fields = {
-            "CN": "Common Name:",
-            "O": "Organization:",
-            "OU": "Organizational Unit:",
-            "C": "Country Code (2 letters):",
-            "ST": "State/Province:",
-            "L": "Locality (City):"
-        }
-        entries = {}
-
-        for i, (key, label) in enumerate(fields.items()):
-            ttk.Label(frame, text=label).grid(row=i, column=0, sticky=tk.W, padx=5, pady=3)
-            var = tk.StringVar()
-            entry = ttk.Entry(frame, textvariable=var, width=40)
-            entry.grid(row=i, column=1, sticky=(tk.W, tk.E), padx=5, pady=3)
-            entries[key] = var
-            if key == "CN": var.set("CryptLink Root CA") # Default CN
-            if key == "C": entry.config(width=5) # Shorter entry for country code
-
-        button_frame = ttk.Frame(frame)
-        button_frame.grid(row=len(fields), column=0, columnspan=2, pady=10)
-
-        def on_ok():
-            # Basic validation (e.g., CN and C are required)
-            if not entries["CN"].get():
-                messagebox.showerror("Missing Field", "Common Name (CN) is required.", parent=dialog)
-                return
-            if not entries["C"].get() or len(entries["C"].get()) != 2:
-                messagebox.showerror("Invalid Field", "Country Code (C) must be 2 letters.", parent=dialog)
-                return
-
-            for key, var in entries.items():
-                details[key] = var.get().strip()
-            dialog.destroy()
-
-        def on_cancel():
-            details.clear() # Indicate cancellation
-            dialog.destroy()
-
-        ok_button = ttk.Button(button_frame, text="OK", command=on_ok)
-        ok_button.pack(side=tk.LEFT, padx=5)
-        cancel_button = ttk.Button(button_frame, text="Cancel", command=on_cancel)
-        cancel_button.pack(side=tk.LEFT, padx=5)
-
-        dialog.protocol("WM_DELETE_WINDOW", on_cancel) # Handle window close
-        dialog.wait_window() # Wait for the dialog to close
-
-        # Return the collected details dictionary, or empty if cancelled
-        return details if details else None
-
-
-
-    def _admin_generate_bundle(self):
-        if not self.admin_ca_cert or not self.admin_ca_key:
-            messagebox.showerror("CA Not Loaded", "Cannot generate bundle: CA is not loaded. Use 'Load/Create CA' first.", parent=self.root) # Use self.root as parent
-            self._log_message("[Admin] Bundle generation failed: CA not loaded.", constants.LOG_LEVEL_ERROR)
-            return
-
-        client_cn = self.admin_client_cn_var.get().strip()
-        if not client_cn:
-            messagebox.showerror("Client Name Required", "Please enter a Client Name (Common Name) for the certificate.", parent=self.root) # Use self.root as parent
-            self._log_message("[Admin] Bundle generation failed: Client Name missing.", constants.LOG_LEVEL_ERROR)
-            return
-
-        # --- Removed client details dialog ---
-        # client_details = self._prompt_client_details()
-        # if not client_details:
-        #     self._log_message("[Admin] Client details entry cancelled.", constants.LOG_LEVEL_INFO)
-        #     return
-
-        self._log_message(f"[Admin] Generating client certificate and key for CN: {client_cn}...", constants.LOG_LEVEL_INFO)
-        client_cert_pem, client_key_pem, msg = utils.create_client_cert_and_key(self.admin_ca_cert, self.admin_ca_key, client_cn) # Pass only CN
-
-        if not client_cert_pem or not client_key_pem:
-            self._log_message(f"[Admin] Client cert/key generation failed: {msg}", constants.LOG_LEVEL_ERROR) # Use _log_message
-            messagebox.showerror("Generation Failed", f"Could not generate client certificate/key:\n{msg}", parent=self.root) # Use self.root as parent
-            return
-        self._log_message("[Admin] Client certificate and key generated successfully.", constants.LOG_LEVEL_INFO) # Use _log_message
-
-        password = simpledialog.askstring("Set Bundle Password", "Enter a password to encrypt the bundle:", show='*', parent=self.root) # Use self.root as parent
-        if not password: self._log_message("[Admin] Bundle creation cancelled by user (no password).", constants.LOG_LEVEL_INFO); return
-        password_confirm = simpledialog.askstring("Confirm Password", "Confirm the password:", show='*', parent=self.root) # Use self.root as parent
-        if password != password_confirm: messagebox.showerror("Password Mismatch", "Passwords do not match.", parent=self.root); self._log_message("[Admin] Bundle creation failed: Password mismatch.", constants.LOG_LEVEL_ERROR); return
-
-        bundle_path = filedialog.asksaveasfilename(title="Save Client Bundle", defaultextension=constants.BUNDLE_FILE_EXTENSION, filetypes=[(f"CryptLink Bundle (*{constants.BUNDLE_FILE_EXTENSION})", f"*{constants.BUNDLE_FILE_EXTENSION}"), ("All Files", "*.*")], initialdir=utils.get_downloads_folder(), parent=self.root) # Use self.root as parent
-        if not bundle_path: self._log_message("[Admin] Bundle creation cancelled by user (no save path).", constants.LOG_LEVEL_INFO); return
-
-        self._log_message(f"[Admin] Creating encrypted bundle at: {bundle_path}...", constants.LOG_LEVEL_INFO)
-        # Pass the CA cert object directly, not its PEM string
-        success, msg = utils.create_encrypted_bundle(bundle_path, password, self.admin_ca_cert, client_cert_pem, client_key_pem, client_cn)
-
-        if success:
-            self._log_message(f"[Admin] Bundle created successfully: {msg}", constants.LOG_LEVEL_INFO)
-            messagebox.showinfo("Bundle Created", f"Client bundle for '{client_cn}' created successfully:\n{bundle_path}", parent=self.root) # Use self.root as parent
-        else:
-            self._log_message(f"[Admin] Bundle creation failed: {msg}", constants.LOG_LEVEL_ERROR) # Use _log_message
-            messagebox.showerror("Bundle Creation Failed", f"Could not create the encrypted bundle:\n{msg}", parent=self.root) # Use self.root as parent
-
-    def _prompt_client_details(self):
-        """Opens a dialog to collect Client subject details, pre-filled from CA."""
-        # --- This function is no longer called and can be removed entirely ---
-        if not self.admin_ca_cert:
-            messagebox.showerror("CA Not Loaded", "Cannot get defaults: CA is not loaded.", parent=self.root) # Use self.root as parent
-            return None
-
-        dialog = tk.Toplevel(self.root) # Use self.root as parent
-        dialog.title("Enter Client Certificate Details")
-        dialog.transient(self.root) # Make transient to root
-        dialog.grab_set()
-        dialog.resizable(False, False)
-
-        details = {}
-        frame = ttk.Frame(dialog, padding="10")
-        frame.pack(expand=True, fill="both")
-
-        # Fields excluding CN (which is entered in the main admin window)
-        fields = {
-            "O": "Organization:",
-            "OU": "Organizational Unit:",
-            "L": "Locality (City):",
-            "ST": "State/Province:",
-            "C": "Country Code (2 letters):"
-        }
-        entries = {}
-
-        # Get defaults from CA subject
-        ca_subject_dict = {attr.oid.dotted_string: attr.value for attr in self.admin_ca_cert.subject}
-        defaults = {
-            "C": ca_subject_dict.get(NameOID.COUNTRY_NAME.dotted_string, ""),
-            "ST": ca_subject_dict.get(NameOID.STATE_OR_PROVINCE_NAME.dotted_string, ""),
-            "L": ca_subject_dict.get(NameOID.LOCALITY_NAME.dotted_string, ""),
-            "O": ca_subject_dict.get(NameOID.ORGANIZATION_NAME.dotted_string, ""),
-            "OU": ca_subject_dict.get(NameOID.ORGANIZATIONAL_UNIT_NAME.dotted_string, ""),
+    def _get_local_peer_info(self):
+        """Gathers local hostname, IP, and certificate fingerprint."""
+        fingerprint_to_send = self.local_full_fingerprint
+        if fingerprint_to_send is None:
+            self._log_message("CRITICAL_INFO: _get_local_peer_info: self.local_full_fingerprint is None. Sending 'N/A_FP'.", constants.LOG_LEVEL_ERROR)
+            fingerprint_to_send = "N/A_FP" # Send a placeholder
+        
+        return {
+            "hostname": self.local_hostname,
+            "ip": self.local_ip,
+            "fingerprint": fingerprint_to_send
         }
 
-        for i, (key, label) in enumerate(fields.items()):
-            ttk.Label(frame, text=label).grid(row=i, column=0, sticky=tk.W, padx=5, pady=3)
-            var = tk.StringVar(value=defaults.get(key, "")) # Pre-fill with default
-            entry = ttk.Entry(frame, textvariable=var, width=40)
-            entry.grid(row=i, column=1, sticky=(tk.W, tk.E), padx=5, pady=3)
-            entries[key] = var
-            if key == "C": entry.config(width=5)
-
-        button_frame = ttk.Frame(frame)
-        button_frame.grid(row=len(fields), column=0, columnspan=2, pady=10)
-
-        def on_ok():
-            # Basic validation (e.g., C is required)
-            if not entries["C"].get() or len(entries["C"].get()) != 2:
-                messagebox.showerror("Invalid Field", "Country Code (C) must be 2 letters.", parent=dialog)
-                return
-
-            for key, var in entries.items():
-                details[key] = var.get().strip()
-            dialog.destroy()
-
-        def on_cancel():
-            details.clear() # Indicate cancellation
-            dialog.destroy()
-
-        ok_button = ttk.Button(button_frame, text="OK", command=on_ok)
-        ok_button.pack(side=tk.LEFT, padx=5)
-        cancel_button = ttk.Button(button_frame, text="Cancel", command=on_cancel)
-        cancel_button.pack(side=tk.LEFT, padx=5)
-
-        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
-        dialog.wait_window()
-
-        return details if details else None
-
-    def _admin_export_ca(self):
-        if not self.admin_ca_cert or not self.admin_ca_key:
-            messagebox.showerror("CA Not Loaded", "Cannot export: CA is not loaded.", parent=self.root); return # Use self.root as parent
-
-        cert_path = filedialog.asksaveasfilename(title="Save CA Certificate As...", defaultextension=".pem", filetypes=[("PEM Certificate", "*.pem"), ("CRT Certificate", "*.crt"), ("All Files", "*.*")], initialdir=utils.get_downloads_folder(), parent=self.root) # Use self.root as parent
-        if not cert_path: self._log_message("[Admin] CA export cancelled (no cert path).", constants.LOG_LEVEL_INFO); return
-        key_path = filedialog.asksaveasfilename(title="Save CA Private Key As...", defaultextension=".key", filetypes=[("PEM Private Key", "*.key"), ("All Files", "*.*")], initialdir=utils.get_downloads_folder(), parent=self.root) # Use self.root as parent
-        if not key_path: self._log_message("[Admin] CA export cancelled (no key path).", constants.LOG_LEVEL_INFO); return
-
-        self._log_message(f"[Admin] Attempting to export CA cert to {cert_path} and key to {key_path}...", constants.LOG_LEVEL_INFO)
-        success, msg = utils.export_ca_from_keyring(cert_path, key_path)
-        if success: messagebox.showinfo("CA Exported", f"CA certificate and key exported successfully.", parent=self.root); self._log_message(f"[Admin] {msg}", constants.LOG_LEVEL_INFO) # Use self.root as parent
-        else: messagebox.showerror("Export Failed", f"Could not export CA:\n{msg}", parent=self.root); self._log_message(f"[Admin] CA export failed: {msg}", constants.LOG_LEVEL_ERROR) # Use self.root as parent
-
-    def _admin_clear_ca(self):
-        if messagebox.askyesno("Confirm Clear CA", "Are you sure you want to permanently remove the CryptLink CA certificate and key from your system keyring?\n\nThis cannot be undone easily.", icon='warning', parent=self.root): # Use self.root as parent
-            self._log_message("[Admin] Attempting to clear CA from keyring...", constants.LOG_LEVEL_INFO)
-            success, msg = utils.clear_ca_from_keyring()
-            if success: messagebox.showinfo("CA Cleared", "CA certificate and key removed from keyring.", parent=self.root); self._log_message(f"[Admin] {msg}", constants.LOG_LEVEL_INFO) # Use self.root as parent
-            else: messagebox.showwarning("Clear CA Warning", f"Could not fully clear CA from keyring (it might not have existed):\n{msg}", parent=self.root); self._log_message(f"[Admin] CA clear warning/error: {msg}", constants.LOG_LEVEL_WARN) # Use self.root as parent
-            self._admin_check_ca_status() # Update status display
-        else: self._log_message("[Admin] User cancelled CA clearing.", constants.LOG_LEVEL_INFO) # Use _log_message
-
-    # --- View Switching ---
-    def _show_main_view(self):
-        """Shows the main connection/transfer view, hides identities."""
+    def _verify_peer_fingerprint_dialog(self, peer_fp_display, callback):
+        """Shows a dialog to verify the peer's certificate fingerprint."""
+        # This runs in the main GUI thread due to _process_gui_queue
+        title = "Verify Peer Identity"
+        message = (
+            f"You are connecting to a peer with the following certificate fingerprint:\n\n"
+            f"{peer_fp_display}\n\n"
+            f"Your fingerprint is:\n"
+            f"{self.local_fingerprint_display.get()}\n\n"
+            f"Please VERIFY this fingerprint with the peer out-of-band (e.g., voice, text).\n"
+            f"Do you trust this fingerprint and want to connect?"
+        )
         try:
-            # Show main view widgets
-            self.conn_frame.grid(row=1, column=0, sticky=tk.W, pady=5) # Changed sticky
-            self.status_frame.grid(row=2, column=0, sticky=tk.W, pady=5) # Changed sticky
-            self.transfer_frame.grid(row=3, column=0, sticky=tk.W, pady=5) # Changed sticky
-            self.received_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5))
+            # Ensure the dialog is transient to the main window if possible
+            # For simpledialog, parent is implicitly handled if self.root is active
+            # For messagebox, parent=self.root is good practice.
+            user_choice = messagebox.askyesnocancel(title, message, icon=messagebox.QUESTION, parent=self.root)
 
-            # Hide other views
-            self.cert_frame.grid_forget()
-            self.admin_tools_frame.grid_forget()
-            self.identity_persistence_frame.grid_forget()
+            if user_choice is True: # Yes
+                callback(True)
+            elif user_choice is False: # No
+                callback(False)
+            else: # Cancel or dialog closed
+                self._log_message("Peer fingerprint verification cancelled by user.", constants.LOG_LEVEL_INFO)
+                callback(None) # Indicate cancellation / timeout scenario
+        except tk.TclError as e: # Window might be closing
+            self._log_message(f"Error showing fingerprint dialog (window closed?): {e}", constants.LOG_LEVEL_WARN)
+            callback(None)
 
-            # Update menu state
-            self.menu_bar.entryconfig("Home", state='disabled')
-            self.menu_bar.entryconfig("Admin Tools", state='normal')
-            self.menu_bar.entryconfig("Identities", state='normal')
-            self._log_message("Switched to Main View.", constants.LOG_LEVEL_DEBUG)
-        except AttributeError:
-            self._log_message("Error switching to Main View: Widgets not fully initialized yet.", constants.LOG_LEVEL_WARN)
 
-    def _show_identities_view(self):
-        """Shows the identities/certificates view, hides main connection/transfer."""
-        # Hide main view widgets
-        self.conn_frame.grid_forget()
-        self.status_frame.grid_forget()
-        self.transfer_frame.grid_forget()
-        self.received_frame.grid_forget()
-        self.admin_tools_frame.grid_forget()
-        self._update_identity_persistence_buttons_state() # Update button states when view is shown
+    def _send_command(self, sock, command_dict):
+        """Sends a JSON command over the SSL socket."""
+        if not sock:
+            self._log_message("Send command failed: socket is None.", constants.LOG_LEVEL_ERROR)
+            return
+        try:
+            command_json = json.dumps(command_dict)
+            if len(command_json) > constants.MAX_CMD_LEN: # Corrected constant name
+                self._log_message(f"Command too long to send: {len(command_json)} bytes. Type: {command_dict.get('type', 'Unknown')}", constants.LOG_LEVEL_ERROR)
+                # For file chunks, this should not happen due to chunking.
+                # For other commands, this indicates a design issue or unexpected data.
+                if command_dict.get("type") != "FILE_CHUNK": # Don't disconnect for long file chunks (should be impossible)
+                    raise ValueError("Command too long")
+                # If it's a file chunk, something is very wrong with chunking logic.
+                # For now, we'll let it try to send and likely fail or be handled by peer.
 
-        # Show identities widget
-        self.cert_frame.grid(row=0, column=0, sticky=tk.W, pady=5) # Changed sticky
-        self.identity_persistence_frame.grid(row=1, column=0, sticky=tk.W, pady=5, padx=5)
+            command_bytes = command_json.encode('utf-8')
+            # Simple framing: send length first, then data
+            length_prefix = len(command_bytes).to_bytes(4, 'big')
+            sock.sendall(length_prefix + command_bytes)
+            # Log sensitive data carefully
+            log_cmd_dict = command_dict.copy()
+            if log_cmd_dict.get("type") == "FILE_CHUNK" and "data" in log_cmd_dict and isinstance(log_cmd_dict["data"], dict):
+                original_chunk_b64 = log_cmd_dict["data"].get("chunk", "")
+                # Log the length of the original binary data, not the base64 string
+                log_cmd_dict["data"] = f"<FILE_CHUNK: original data len {len(base64.b64decode(original_chunk_b64.encode('ascii') if isinstance(original_chunk_b64, str) else original_chunk_b64))}>"
+            self._log_message(f"Sent command: {log_cmd_dict}", constants.LOG_LEVEL_DEBUG)
+        except (socket.error, ssl.SSLError, AttributeError, ValueError) as e: # Added AttributeError for sock=None case, ValueError for long command
+            self._log_message(f"Error sending command: {e}. Command type: {command_dict.get('type', 'Unknown')}", constants.LOG_LEVEL_ERROR)
+            self._disconnect_peer(reason=f"Send error: {e}") # Disconnect on send error
 
-        # Update menu state
-        self.menu_bar.entryconfig("Home", state='normal')
-        self.menu_bar.entryconfig("Admin Tools", state='normal')
-        self.menu_bar.entryconfig("Identities", state='disabled')
-        self._log_message("Switched to Identities View.", constants.LOG_LEVEL_DEBUG)
+    def _receive_command(self, sock):
+        """Receives a JSON command from the SSL socket."""
+        if not sock:
+            self._log_message("Receive command failed: socket is None.", constants.LOG_LEVEL_ERROR)
+            return None
+        try:
+            # Receive length prefix
+            length_prefix_bytes = sock.recv(4)
+            if not length_prefix_bytes: # Connection closed by peer
+                self._log_message("Connection closed by peer while waiting for command length.", constants.LOG_LEVEL_INFO)
+                return None
+            msg_len = int.from_bytes(length_prefix_bytes, 'big')
 
-    def _show_admin_tools_view(self):
-        """Shows the admin tools view, hides others."""
-        # Hide other views
-        self.conn_frame.grid_forget()
-        self.status_frame.grid_forget()
-        self.transfer_frame.grid_forget()
-        self.received_frame.grid_forget()
-        self.cert_frame.grid_forget()
-        self.identity_persistence_frame.grid_forget()
+            if msg_len > constants.MAX_CMD_LEN: # Corrected constant name
+                self._log_message(f"Received command too long: {msg_len} bytes. Disconnecting.", constants.LOG_LEVEL_ERROR)
+                self._disconnect_peer(reason="Received oversized command")
+                return None
 
-        # Show admin tools frame (spanning multiple rows conceptually)
-        self.admin_tools_frame.grid(row=0, column=0, rowspan=4, sticky=tk.W, pady=5) # Changed sticky
-        self._admin_check_ca_status() # Check status when showing the view
+            # Receive the actual command
+            chunks = []
+            bytes_recd = 0
+            while bytes_recd < msg_len:
+                chunk = sock.recv(min(msg_len - bytes_recd, constants.BUFFER_SIZE)) # Corrected constant name
+                if not chunk: # Connection closed unexpectedly
+                    self._log_message("Connection closed by peer unexpectedly during command receive.", constants.LOG_LEVEL_ERROR)
+                    return None
+                chunks.append(chunk)
+                bytes_recd += len(chunk)
 
-        # Update menu state
-        self.menu_bar.entryconfig("Home", state='normal')
-        self.menu_bar.entryconfig("Identities", state='normal')
-        self.menu_bar.entryconfig("Admin Tools", state='disabled')
-        self._log_message("Switched to Admin Tools View.", constants.LOG_LEVEL_DEBUG) # Corrected log message
+            command_json = b"".join(chunks).decode('utf-8')
+            command_dict = json.loads(command_json)
+            # Log sensitive data carefully
+            log_cmd_dict = command_dict.copy()
+            if log_cmd_dict.get("type") == "FILE_CHUNK" and "data" in log_cmd_dict and isinstance(log_cmd_dict["data"], dict):
+                # log_cmd_dict['data'] is {'chunk': 'base64string'}
+                received_chunk_b64 = log_cmd_dict["data"].get("chunk", "")
+                log_cmd_dict["data"] = f"<FILE_CHUNK: original data len {len(base64.b64decode(received_chunk_b64.encode('ascii') if isinstance(received_chunk_b64, str) else received_chunk_b64))}>"
+            self._log_message(f"Received command: {log_cmd_dict}", constants.LOG_LEVEL_DEBUG)
+            return command_dict
+        except (socket.error, ssl.SSLError, json.JSONDecodeError, ValueError, TypeError, AttributeError) as e: # Added more error types
+            self._log_message(f"Error receiving or parsing command: {e}", constants.LOG_LEVEL_ERROR)
+            # Don't auto-disconnect here, let the communication_loop handle it based on context
+            return None # Indicate error to caller
 
-    # --- Identity Persistence ---
-    def _load_identity_from_keyring_on_startup(self):
-        self._log_message("Checking keyring for stored identity on startup...", constants.LOG_LEVEL_DEBUG)
-        identity_data, msg = utils.get_identity_from_keyring()
-        if identity_data:
-            self._log_message(f"Identity found in keyring: {msg}", constants.LOG_LEVEL_INFO)
-            self.keyring_has_user_identity = True
-            self._cleanup_temp_files() # Clean any previous temp files
-            temp_files_created = {}
+    def _communication_loop(self):
+        """Main loop for receiving and processing commands from the peer."""
+        self._log_message("Starting communication loop.", constants.LOG_LEVEL_DEBUG)
+        try:
+            while self.is_connected and not self.stop_event.is_set():
+                if not self.client_socket: break # Socket closed by another thread
+                # Set a timeout on recv so the loop can break if self.is_connected becomes false
+                # This is implicitly handled by _receive_command if it uses socket.settimeout or select
+                # For now, _receive_command blocks until data or error.
+                # A better approach might involve select() or making client_socket non-blocking
+                # and handling EWOULDBLOCK/EAGAIN.
+                # However, for simplicity, we rely on heartbeat to detect dead connections.
+                # If _receive_command returns None due to graceful close or error, loop will break.
+
+                command = self._receive_command(self.client_socket)
+                if command is None: # Error or connection closed
+                    self._log_message("Communication loop: receive_command returned None. Assuming disconnection.", constants.LOG_LEVEL_INFO)
+                    self._disconnect_peer(reason="Peer disconnected or receive error")
+                    break # Exit loop
+
+                cmd_type = command.get("type")
+                cmd_data = command.get("data")
+
+                if cmd_type == "HEARTBEAT":
+                    self._send_command(self.client_socket, {"type": "HEARTBEAT_ACK"})
+                elif cmd_type == "HEARTBEAT_ACK":
+                    with self.heartbeat_lock:
+                        self.last_heartbeat_ack_time = time.monotonic()
+                elif cmd_type == "SEND_FILE":
+                    self._handle_send_file_command(cmd_data)
+                elif cmd_type == "ACCEPT_FILE":
+                    self._handle_accept_file_command(cmd_data)
+                elif cmd_type == "REJECT_FILE":
+                    self._handle_reject_file_command(cmd_data)
+                elif cmd_type == "FILE_CHUNK":
+                    self._handle_file_chunk_command(cmd_data)
+                elif cmd_type == "TRANSFER_COMPLETE":
+                    self._handle_transfer_complete_command(cmd_data)
+                elif cmd_type == "VERIFICATION_ACCEPTED":
+                    # This is the client confirming its side after server already started comms loop.
+                    self._log_message("Received final VERIFICATION_ACCEPTED from peer. Connection fully established.", constants.LOG_LEVEL_DEBUG)
+                    # No specific action needed here by the receiver of this message in the main loop.
+                elif cmd_type == "CANCEL_TRANSFER":
+                    self._handle_cancel_transfer_command(cmd_data)
+                # VERIFICATION_ACCEPTED/REJECTED are handled during connection setup
+                else:
+                    self._log_message(f"Received unknown command type: {cmd_type}", constants.LOG_LEVEL_WARN)
+
+        except Exception as e:
+            if self.is_connected: # Only log if we didn't expect to disconnect
+                self._log_message(f"Exception in communication loop: {e}", constants.LOG_LEVEL_ERROR)
+            # self._disconnect_peer(reason=f"Comm loop error: {e}") # This might cause double disconnect
+        finally:
+            self._log_message("Communication loop ended.", constants.LOG_LEVEL_DEBUG)
+            # If still "connected" but loop ended, means an issue.
+            if self.is_connected:
+                 self._disconnect_peer(reason="Communication loop terminated unexpectedly")
+
+
+    def _start_heartbeat(self):
+        """Starts the heartbeat thread."""
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            return # Already running
+        with self.heartbeat_lock:
+            self.last_heartbeat_ack_time = time.monotonic() # Initialize
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self.heartbeat_thread.start()
+        self._log_message("Heartbeat thread started.", constants.LOG_LEVEL_DEBUG)
+
+    def _heartbeat_loop(self):
+        """Periodically sends heartbeats and checks for acknowledgments."""
+        while self.is_connected and not self.stop_event.is_set():
             try:
-                temp_files_created["ca_data"] = self._write_temp_cert(identity_data["ca_cert_pem"].encode('utf-8'), ".crt")
-                temp_files_created["cert_data"] = self._write_temp_cert(identity_data["client_cert_pem"].encode('utf-8'), ".crt")
-                temp_files_created["key_data"] = self._write_temp_cert(identity_data["client_key_pem"].encode('utf-8'), ".key")
+                time.sleep(constants.HEARTBEAT_INTERVAL)
+                if not self.is_connected: break # Check again after sleep
 
-                self.ca_cert_path.set(temp_files_created["ca_data"])
-                self.client_cert_path.set(temp_files_created["cert_data"])
-                self.client_key_path.set(temp_files_created["key_data"])
-                self.ca_cert_display_name.set(identity_data["ca_display_name"])
-                self.client_cert_display_name.set(identity_data["client_cert_display_name"])
-                self.client_key_display_name.set(identity_data["client_key_display_name"])
+                with self.heartbeat_lock:
+                    if time.monotonic() - self.last_heartbeat_ack_time > constants.HEARTBEAT_TIMEOUT:
+                        self._log_message("Heartbeat timeout. Peer unresponsive.", constants.LOG_LEVEL_WARN)
+                        self._disconnect_peer(reason="Heartbeat timeout")
+                        break
+                if self.client_socket: # Ensure socket exists before sending
+                    self._send_command(self.client_socket, {"type": "HEARTBEAT"})
+                else: # Socket got closed somehow
+                    self._log_message("Heartbeat: client_socket is None. Disconnecting.", constants.LOG_LEVEL_WARN)
+                    self._disconnect_peer(reason="Socket closed unexpectedly")
+                    break
+            except Exception as e:
+                if self.is_connected: # Only log if we didn't expect to disconnect
+                    self._log_message(f"Error in heartbeat loop: {e}", constants.LOG_LEVEL_ERROR)
+                break # Exit loop on error
+        self._log_message("Heartbeat thread stopped.", constants.LOG_LEVEL_DEBUG)
+
+    def _disconnect_peer(self, reason="Unknown"):
+        """Closes the connection to the peer and resets state."""
+        if not self.is_connected and not self.is_connecting:
+            # self._log_message(f"Disconnect called but not connected/connecting. Reason: {reason}", constants.LOG_LEVEL_DEBUG)
+            return # Already disconnected or not connected
+
+        self._log_message(f"Disconnecting from peer. Reason: {reason}", constants.LOG_LEVEL_INFO)
+
+        was_connected = self.is_connected
+        self.is_connected = False
+        self.is_connecting = False # Also reset if was in connecting state
+
+        if self.is_transferring:
+            self._cancel_transfer(notify_peer=False) # Cancel local transfer, don't notify if connection is already dead
+
+        if self.client_socket:
+            try:
+                self.client_socket.shutdown(socket.SHUT_RDWR)
+            except (socket.error, OSError): pass # Ignore errors on shutdown, socket might be already closed
+            try:
+                self.client_socket.close()
+            except (socket.error, OSError): pass
+            self.client_socket = None
+            self._log_message("Client socket closed.", constants.LOG_LEVEL_DEBUG)
+
+        # Stop heartbeat thread by virtue of self.is_connected being False
+        # The thread should check this flag and exit.
+
+        self.gui_queue.put(("clear_peer_info", None))
+        if self.certs_loaded_correctly:
+            self.gui_queue.put(("status", "Disconnected"))
+        else:
+            self.gui_queue.put(("status", "No Certs")) # Should not happen if was connected
+
+        # If server was handling this connection, it's now free to accept new ones.
+        # If client initiated this, it's now fully disconnected.
+        # Restart server listening if it was stopped due to active connection
+        if was_connected and self.certs_loaded_correctly and (not self.server_thread or not self.server_thread.is_alive()):
+             self._log_message("Attempting to restart server listening after disconnect.", constants.LOG_LEVEL_DEBUG)
+             self._start_server_if_needed()
+
+
+    def _send_file(self):
+        """Initiates the file sending process."""
+        if not self.is_connected:
+            self.gui_queue.put(("show_error", "Not connected to a peer."))
+            return
+        if self.is_transferring:
+            self.gui_queue.put(("show_error", "A file transfer is already in progress."))
+            return
+
+        filepath = self.file_to_send_path.get()
+        if not filepath or not os.path.exists(filepath):
+            self.gui_queue.put(("show_error", "File not found or not selected."))
+            return
+
+        try:
+            filesize = os.path.getsize(filepath)
+            filename = os.path.basename(filepath)
+
+            self.is_transferring = True
+            self.transfer_cancelled_by_user = False
+            self.current_transfer_info = {
+                "filepath": filepath, "filename": filename,
+                "filesize": filesize, "role": "sender",
+                "bytes_sent": 0, "start_time": time.monotonic()
+            }
+            self.gui_queue.put(("sender_status", ("Waiting for peer to accept...", "blue", False)))
+            gui.update_status_display(self) # Disable other buttons
+
+            self._send_command(self.client_socket, {
+                "type": "SEND_FILE",
+                "data": {"filename": filename, "filesize": filesize}
+            })
+            self._log_message(f"Sent SEND_FILE command for {filename} ({utils.format_bytes(filesize)}).")
+
+        except OSError as e:
+            self._log_message(f"Error accessing file {filepath}: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"Error accessing file: {e}"))
+            self._reset_transfer_state()
+            self.gui_queue.put(("transfer_cancelled_ui", True)) # True for sender role
+        except Exception as e:
+            self._log_message(f"Unexpected error initiating file send: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"Unexpected error: {e}"))
+            self._reset_transfer_state()
+            self.gui_queue.put(("transfer_cancelled_ui", True))
+
+    def _handle_send_file_command(self, data):
+        """Handles an incoming SEND_FILE command from the peer."""
+        if self.is_transferring:
+            self._log_message("Received SEND_FILE while another transfer is in progress. Rejecting.", constants.LOG_LEVEL_WARN)
+            self._send_command(self.client_socket, {"type": "REJECT_FILE", "data": {"reason": "Busy with another transfer."}})
+            return
+
+        filename = data.get("filename")
+        filesize = data.get("filesize")
+        if not filename or filesize is None:
+            self._log_message("Received malformed SEND_FILE command.", constants.LOG_LEVEL_ERROR)
+            self._send_command(self.client_socket, {"type": "REJECT_FILE", "data": {"reason": "Malformed command."}})
+            return
+
+        self.is_transferring = True # Tentatively set, might be rejected by user
+        self.transfer_cancelled_by_user = False
+        self.current_transfer_info = {
+            "filename": filename, "filesize": filesize, "role": "receiver",
+            "bytes_received": 0, "start_time": time.monotonic(), "file_handle": None, "temp_filepath": None
+        }
+        gui.update_status_display(self) # Disable other buttons
+
+        # Prompt user to accept/reject via GUI queue
+        filesize_str = utils.format_bytes(filesize)
+        self.gui_queue.put(("sender_status", (f"Receiving {filename} ({filesize_str})...", "blue", False)))
+
+        accept_event = threading.Event()
+        user_choice = None # True for accept, False for reject, None for timeout/error
+
+        def set_accept_result(accepted):
+            nonlocal user_choice
+            user_choice = accepted
+            accept_event.set()
+
+        self.gui_queue.put(("prompt_file_accept", (filename, filesize_str, set_accept_result)))
+        accept_event.wait(timeout=constants.FILE_ACCEPT_TIMEOUT) # Wait for user input
+
+        if user_choice is True:
+            self._log_message(f"User accepted file: {filename}", constants.LOG_LEVEL_INFO)
+            # Prepare to receive file
+            downloads_folder = utils.get_downloads_folder()
+            # Sanitize filename slightly (very basic, consider more robust library if needed)
+            safe_filename = "".join(c for c in filename if c.isalnum() or c in ('.', '_', '-')).strip()
+            if not safe_filename: safe_filename = "downloaded_file"
+
+            # Ensure unique filename in downloads folder
+            base, ext = os.path.splitext(safe_filename)
+            counter = 1
+            final_filename = safe_filename
+            while os.path.exists(os.path.join(downloads_folder, final_filename)):
+                final_filename = f"{base}_{counter}{ext}"
+                counter += 1
+            self.current_transfer_info["final_filepath"] = os.path.join(downloads_folder, final_filename)
+
+            # Use a temporary name during download
+            temp_fd, temp_dl_path = tempfile.mkstemp(suffix=".part", prefix=f"{base}_", dir=downloads_folder)
+            self.current_transfer_info["temp_filepath"] = temp_dl_path
+            self.current_transfer_info["file_handle"] = os.fdopen(temp_fd, "wb")
+
+            self._send_command(self.client_socket, {"type": "ACCEPT_FILE", "data": {"filename": filename}})
+            self.gui_queue.put(("sender_status", (f"Downloading {filename}...", "blue", False)))
+        elif user_choice is False:
+            self._log_message(f"User rejected file: {filename}", constants.LOG_LEVEL_INFO)
+            self._send_command(self.client_socket, {"type": "REJECT_FILE", "data": {"reason": "User rejected file."}})
+            self._reset_transfer_state()
+            self.gui_queue.put(("transfer_cancelled_ui", False)) # False for receiver role
+            self.gui_queue.put(("sender_status", ("File rejected by you.", "red", True)))
+        else: # Timeout or error
+            self._log_message(f"File acceptance for {filename} timed out or was cancelled.", constants.LOG_LEVEL_WARN)
+            self._send_command(self.client_socket, {"type": "REJECT_FILE", "data": {"reason": "Acceptance timed out."}})
+            self._reset_transfer_state()
+            self.gui_queue.put(("transfer_cancelled_ui", False))
+            self.gui_queue.put(("sender_status", ("File acceptance timed out.", "red", True)))
+
+
+    def _prompt_accept_file_dialog(self, filename, filesize_str, callback):
+        """Shows a dialog to accept or reject an incoming file."""
+        # Runs in main GUI thread
+        title = "Incoming File Transfer"
+        peer_display = self.peer_hostname.get() if self.peer_hostname.get() != "N/A" else "Peer"
+        message = (
+            f"{peer_display} wants to send you a file:\n\n"
+            f"Filename: {filename}\n"
+            f"Size: {filesize_str}\n\n"
+            f"Do you want to accept this file?"
+        )
+        try:
+            user_choice = messagebox.askyesno(title, message, icon=messagebox.QUESTION, parent=self.root)
+            callback(user_choice) # True for Yes, False for No
+        except tk.TclError as e:
+            self._log_message(f"Error showing file accept dialog (window closed?): {e}", constants.LOG_LEVEL_WARN)
+            callback(None) # Indicate error/cancellation
+
+    def _handle_accept_file_command(self, data):
+        """Handles peer's acceptance of a file transfer."""
+        if not self.is_transferring or self.current_transfer_info.get("role") != "sender":
+            self._log_message("Received ACCEPT_FILE but not in sending state.", constants.LOG_LEVEL_WARN)
+            return
+
+        filename_accepted = data.get("filename")
+        if filename_accepted != self.current_transfer_info["filename"]:
+            self._log_message(f"Received ACCEPT_FILE for wrong file: {filename_accepted} (expected {self.current_transfer_info['filename']})", constants.LOG_LEVEL_WARN)
+            self._cancel_transfer(notify_peer=True, reason="File mismatch")
+            return
+
+        self._log_message(f"Peer accepted file: {filename_accepted}. Starting transfer.", constants.LOG_LEVEL_INFO)
+        self.gui_queue.put(("sender_status", (f"Sending {filename_accepted}...", "blue", False)))
+
+        # Start sending chunks in a new thread to keep comms loop responsive
+        threading.Thread(target=self._send_file_chunks, daemon=True).start()
+
+    def _send_file_chunks(self):
+        """Reads file and sends it in chunks."""
+        info = self.current_transfer_info
+        filepath = info["filepath"]
+        filesize = info["filesize"]
+        bytes_sent = 0
+        try:
+            with open(filepath, "rb") as f:
+                while bytes_sent < filesize:
+                    if self.transfer_cancelled_by_user or not self.is_connected:
+                        self._log_message("File sending cancelled or disconnected during chunk sending.", constants.LOG_LEVEL_INFO)
+                        # _cancel_transfer would have been called already if user cancelled
+                        if not self.transfer_cancelled_by_user: # If disconnected, notify peer might fail
+                             self._cancel_transfer(notify_peer=self.is_connected, reason="Disconnected during send")
+                        return
+
+                    chunk = f.read(constants.FILE_CHUNK_SIZE)
+                    if not chunk: break # End of file
+
+                    self._send_command(self.client_socket, {
+                        "type": "FILE_CHUNK",
+                        "data": {"chunk": base64.b64encode(chunk).decode('ascii')}
+                    })
+                    bytes_sent += len(chunk)
+                    info["bytes_sent"] = bytes_sent
+
+                    # Update progress
+                    progress = (bytes_sent / filesize) * 100 if filesize > 0 else 100
+                    elapsed_time = time.monotonic() - info["start_time"]
+                    speed_bps = (bytes_sent / elapsed_time) if elapsed_time > 0 else 0
+                    speed_str = f"Speed: {utils.format_bytes(speed_bps)}/s"
+                    eta_str = f"ETA: {utils.format_eta((filesize - bytes_sent) / speed_bps if speed_bps > 0 else 0)}"
+                    self.gui_queue.put(("progress", (progress, speed_str, eta_str)))
+                    # Small sleep to allow other threads (like GUI queue processing) to run
+                    # and to prevent overwhelming the network socket buffer on fast systems.
+                    time.sleep(0.001)
+
+
+            if bytes_sent == filesize:
+                self._log_message(f"All chunks sent for {info['filename']}.", constants.LOG_LEVEL_INFO)
+                self._send_command(self.client_socket, {"type": "TRANSFER_COMPLETE", "data": {"filename": info["filename"]}})
+                self.gui_queue.put(("sender_status", ("Transfer complete!", "green", True)))
+                # Sender's job is done, reset state and UI
+                self._reset_transfer_state()
+                self.gui_queue.put(("transfer_complete_ui", True)) # True for sender role
+            else: # Should not happen if EOF is handled correctly (e.g. file shrunk during read)
+                self._log_message(f"File sending ended prematurely for {info['filename']}. Sent {bytes_sent}/{filesize}", constants.LOG_LEVEL_WARN)
+                self._cancel_transfer(notify_peer=True, reason="Incomplete send")
+
+        except OSError as e:
+            self._log_message(f"Error reading file {filepath} during send: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("sender_status", (f"Error reading file: {e}", "red", True)))
+            self._cancel_transfer(notify_peer=True, reason=f"File read error: {e}")
+        except Exception as e:
+            self._log_message(f"Unexpected error sending file chunks: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("sender_status", (f"Transfer error: {e}", "red", True)))
+            self._cancel_transfer(notify_peer=True, reason=f"Unexpected send error: {e}")
+
+
+    def _handle_reject_file_command(self, data):
+        """Handles peer's rejection of a file transfer."""
+        if not self.is_transferring or self.current_transfer_info.get("role") != "sender":
+            self._log_message("Received REJECT_FILE but not in sending state.", constants.LOG_LEVEL_WARN)
+            return
+        reason = data.get("reason", "No reason given.")
+        self._log_message(f"Peer rejected file transfer. Reason: {reason}", constants.LOG_LEVEL_INFO)
+        self.gui_queue.put(("sender_status", (f"Peer rejected file: {reason}", "red", True)))
+        self._reset_transfer_state()
+        self.gui_queue.put(("transfer_cancelled_ui", True)) # True for sender role
+
+    def _handle_file_chunk_command(self, data):
+        """Handles an incoming file chunk."""
+        if not self.is_transferring or self.current_transfer_info.get("role") != "receiver":
+            self._log_message("Received FILE_CHUNK but not in receiving state.", constants.LOG_LEVEL_WARN)
+            return
+        if self.transfer_cancelled_by_user: # User cancelled while chunks were in flight
+            self._log_message("Ignoring FILE_CHUNK, transfer was cancelled by receiver.", constants.LOG_LEVEL_INFO)
+            return
+
+        info = self.current_transfer_info
+        try:
+            chunk_b64 = data.get("chunk")
+            if chunk_b64 is None:
+                raise ValueError("FILE_CHUNK missing 'chunk' data.")
+            chunk = base64.b64decode(chunk_b64)
+
+            if info["file_handle"] and not info["file_handle"].closed:
+                info["file_handle"].write(chunk)
+                info["bytes_received"] += len(chunk)
+
+                # Update progress
+                progress = (info["bytes_received"] / info["filesize"]) * 100 if info["filesize"] > 0 else 100
+                elapsed_time = time.monotonic() - info["start_time"]
+                speed_bps = (info["bytes_received"] / elapsed_time) if elapsed_time > 0 else 0
+                speed_str = f"Speed: {utils.format_bytes(speed_bps)}/s"
+                eta_str = f"ETA: {utils.format_eta((info['filesize'] - info['bytes_received']) / speed_bps if speed_bps > 0 else 0)}"
+                self.gui_queue.put(("progress", (progress, speed_str, eta_str)))
+            else:
+                self._log_message("File handle closed or None while receiving chunk.", constants.LOG_LEVEL_WARN)
+                # This might happen if transfer was cancelled and file handle closed, but chunks still arrive.
+                # No need to send CANCEL_TRANSFER again if already handled.
+
+        except (base64.binascii.Error, OSError, ValueError) as e:
+            self._log_message(f"Error processing file chunk for {info['filename']}: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("sender_status", (f"Error receiving chunk: {e}", "red", True)))
+            self._cancel_transfer(notify_peer=True, reason=f"Chunk processing error: {e}")
+        except Exception as e:
+            self._log_message(f"Unexpected error handling file chunk: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("sender_status", (f"Transfer error: {e}", "red", True)))
+            self._cancel_transfer(notify_peer=True, reason=f"Unexpected chunk error: {e}")
+
+
+    def _handle_transfer_complete_command(self, data):
+        """Handles peer's signal that file transfer is complete."""
+        filename_completed = data.get("filename")
+        info = self.current_transfer_info
+
+        if not self.is_transferring:
+            self._log_message(f"Received TRANSFER_COMPLETE for {filename_completed} but not transferring.", constants.LOG_LEVEL_WARN)
+            return
+
+        if info["filename"] != filename_completed:
+            self._log_message(f"Received TRANSFER_COMPLETE for wrong file: {filename_completed} (expected {info['filename']})", constants.LOG_LEVEL_WARN)
+            # Don't cancel our current transfer if it's a different file, just log.
+            return
+
+        if info["role"] == "receiver":
+            if info["bytes_received"] == info["filesize"]:
+                self._log_message(f"Transfer of {info['filename']} completed successfully by sender. Verifying size.", constants.LOG_LEVEL_INFO)
+                if info["file_handle"]: info["file_handle"].close(); info["file_handle"] = None
+
+                # Rename from .part to final name
+                try:
+                    if os.path.exists(info["temp_filepath"]):
+                         os.rename(info["temp_filepath"], info["final_filepath"])
+                         self._log_message(f"File {info['filename']} saved to {info['final_filepath']}", constants.LOG_LEVEL_INFO)
+                         self.gui_queue.put(("add_received_file", (info["filename"], info["final_filepath"])))
+                         self.gui_queue.put(("sender_status", (f"Received {info['filename']}!", "green", True)))
+                    else: # Temp file disappeared?
+                        self._log_message(f"Error: Temporary file {info['temp_filepath']} not found after transfer.", constants.LOG_LEVEL_ERROR)
+                        self.gui_queue.put(("sender_status", (f"Error: Lost {info['filename']}", "red", True)))
+
+                except OSError as e:
+                    self._log_message(f"Error renaming/finalizing received file {info['filename']}: {e}", constants.LOG_LEVEL_ERROR)
+                    self.gui_queue.put(("sender_status", (f"Error saving {info['filename']}: {e}", "red", True)))
+                finally:
+                    info["temp_filepath"] = None # Clear temp path
+
+            else: # Size mismatch
+                self._log_message(f"Transfer of {info['filename']} complete by sender, but size mismatch. Expected {info['filesize']}, got {info['bytes_received']}", constants.LOG_LEVEL_WARN)
+                self.gui_queue.put(("sender_status", (f"Size mismatch for {info['filename']}", "red", True)))
+                if info["file_handle"]: info["file_handle"].close(); info["file_handle"] = None
+                if info["temp_filepath"] and os.path.exists(info["temp_filepath"]):
+                    try: os.remove(info["temp_filepath"])
+                    except OSError as e: self._log_message(f"Could not remove partial file {info['temp_filepath']}: {e}", constants.LOG_LEVEL_WARN)
+                    info["temp_filepath"] = None
+
+            self._reset_transfer_state()
+            self.gui_queue.put(("transfer_complete_ui", False)) # False for receiver role
+        elif info["role"] == "sender":
+            # This means the receiver acknowledged our TRANSFER_COMPLETE (if we were to implement such an ack)
+            # For now, sender assumes completion after sending TRANSFER_COMPLETE and getting no error.
+            # If receiver sends TRANSFER_COMPLETE, it's an error in protocol for sender.
+            self._log_message(f"Sender received unexpected TRANSFER_COMPLETE for {filename_completed}.", constants.LOG_LEVEL_WARN)
+            # We can choose to finalize our side if we haven't already.
+            if info["bytes_sent"] == info["filesize"]:
+                 self._log_message(f"Transfer of {info['filename']} already marked complete on sender side.", constants.LOG_LEVEL_INFO)
+            self._reset_transfer_state()
+            self.gui_queue.put(("transfer_complete_ui", True)) # True for sender role
+
+    def _cancel_transfer(self, notify_peer=True, reason="User cancelled"):
+        """Cancels the current file transfer."""
+        if not self.is_transferring:
+            # self._log_message("Cancel transfer called but no transfer in progress.", constants.LOG_LEVEL_DEBUG)
+            return
+
+        self._log_message(f"Cancelling transfer of {self.current_transfer_info.get('filename', 'unknown file')}. Reason: {reason}", constants.LOG_LEVEL_INFO)
+        self.transfer_cancelled_by_user = (reason == "User cancelled") # Track if user initiated
+
+        role_is_sender = (self.current_transfer_info.get("role") == "sender")
+
+        if notify_peer and self.is_connected and self.client_socket:
+            try:
+                self._send_command(self.client_socket, {"type": "CANCEL_TRANSFER", "data": {"filename": self.current_transfer_info.get("filename"), "reason": reason}})
+            except Exception as e:
+                self._log_message(f"Error sending CANCEL_TRANSFER notification: {e}", constants.LOG_LEVEL_WARN)
+
+        # Clean up receiver-specific resources
+        if self.current_transfer_info.get("role") == "receiver":
+            fh = self.current_transfer_info.get("file_handle")
+            if fh and not fh.closed: fh.close()
+            temp_path = self.current_transfer_info.get("temp_filepath")
+            if temp_path and os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except OSError as e: self._log_message(f"Error removing temp file {temp_path} on cancel: {e}", constants.LOG_LEVEL_WARN)
+
+        self.gui_queue.put(("sender_status", (f"Transfer cancelled: {reason}", "orange", True)))
+        self._reset_transfer_state()
+        self.gui_queue.put(("transfer_cancelled_ui", role_is_sender))
+
+
+    def _handle_cancel_transfer_command(self, data):
+        """Handles peer's signal to cancel the transfer."""
+        if not self.is_transferring:
+            self._log_message("Received CANCEL_TRANSFER but no transfer in progress.", constants.LOG_LEVEL_WARN)
+            return
+
+        filename_cancelled = data.get("filename")
+        reason = data.get("reason", "Peer cancelled")
+        current_filename = self.current_transfer_info.get("filename")
+
+        if filename_cancelled != current_filename:
+            self._log_message(f"Received CANCEL_TRANSFER for {filename_cancelled}, but current is {current_filename}.", constants.LOG_LEVEL_WARN)
+            return # Not for our current transfer
+
+        self._log_message(f"Peer cancelled transfer of {current_filename}. Reason: {reason}", constants.LOG_LEVEL_INFO)
+        self.gui_queue.put(("sender_status", (f"Peer cancelled: {reason}", "orange", True)))
+
+        role_is_sender = (self.current_transfer_info.get("role") == "sender")
+        # Clean up receiver-specific resources if we are receiver
+        if not role_is_sender:
+            fh = self.current_transfer_info.get("file_handle")
+            if fh and not fh.closed: fh.close()
+            temp_path = self.current_transfer_info.get("temp_filepath")
+            if temp_path and os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except OSError as e: self._log_message(f"Error removing temp file {temp_path} on peer cancel: {e}", constants.LOG_LEVEL_WARN)
+
+        self._reset_transfer_state()
+        self.gui_queue.put(("transfer_cancelled_ui", role_is_sender))
+
+
+    def _reset_transfer_state(self):
+        """Resets all variables related to an active file transfer."""
+        self._log_message("Resetting transfer state.", constants.LOG_LEVEL_DEBUG)
+        self.is_transferring = False
+        self.transfer_cancelled_by_user = False
+        # Close file handle if it's open (receiver side)
+        fh = self.current_transfer_info.get("file_handle")
+        if fh and not fh.closed:
+            try: fh.close()
+            except Exception as e: self._log_message(f"Error closing file handle during reset: {e}", constants.LOG_LEVEL_WARN)
+
+        self.current_transfer_info = {}
+        self.file_to_send_path.set("") # Clear selected file for sending
+        # UI reset for progress etc. is handled by transfer_complete_ui or transfer_cancelled_ui
+        # gui.reset_transfer_ui(self) # This is now called by the UI handlers
+
+    def _load_identity_from_keyring_on_startup(self):
+        """Attempts to load the user's identity from the keyring on startup."""
+        self._log_message("Attempting to load identity from keyring...", constants.LOG_LEVEL_INFO)
+        # utils.get_identity_from_keyring() returns (identity_dict, message_str) or (None, message_str)
+        identity_dict, message = utils.get_identity_from_keyring()
+        self._log_message(message, constants.LOG_LEVEL_DEBUG) # Log the message from utils
+
+        if identity_dict: # Check if the dictionary part is not None
+            self._cleanup_temp_files() # Clean any previous temp files
+            try:
+                # Access items from the identity_dict
+                ca_pem = identity_dict["ca_cert_pem"]
+                client_cert_pem = identity_dict["client_cert_pem"]
+                client_key_pem = identity_dict["client_key_pem"]
+                
+                # Display names are also in the dictionary
+                ca_disp_name = identity_dict.get("ca_display_name", "ca_from_keyring.crt")
+                client_cert_disp_name = identity_dict.get("client_cert_display_name", "client_from_keyring.crt")
+                client_key_disp_name = identity_dict.get("client_key_display_name", "key_from_keyring.key")
+
+                self.ca_cert_path.set(self._write_temp_cert(ca_pem, "_ca.crt"))
+                self.client_cert_path.set(self._write_temp_cert(client_cert_pem, "_client.crt"))
+                self.client_key_path.set(self._write_temp_cert(client_key_pem, "_client.key"))
+                self.ca_cert_display_name.set(ca_disp_name)
+                self.client_cert_display_name.set(client_cert_disp_name)
+                self.client_key_display_name.set(client_key_disp_name)
 
                 self.identity_loaded_from_keyring = True
-                self.loaded_from_bundle = True # To prevent export prompt from _save_certs
-                # Defer _save_certs until after main window is up if called too early
-                if self.root.winfo_exists() and hasattr(self, 'save_certs_button'):
-                    self.root.after(200, self._save_certs)
-                else: # If called before GUI fully ready, schedule for later
-                    self.root.after(1000, lambda: self.root.after(200, self._save_certs) if hasattr(self, 'save_certs_button') else None)
-
-            except Exception as e:
-                self._log_message(f"Error processing identity from keyring: {e}", constants.LOG_LEVEL_ERROR)
+                self.loaded_from_bundle = True # Treat as a bundle for export prompts
+                self.bundle_exported_this_session = True # No need to prompt export
+                self.keyring_has_user_identity = True
+                self._log_message("Identity successfully loaded from keyring using temporary files.", constants.LOG_LEVEL_INFO)
+                self.root.after(100, self._save_certs) # Validate and load the temp certs
+            except KeyError as e:
+                self._log_message(f"Error processing identity from keyring: Missing key {e}", constants.LOG_LEVEL_ERROR)
+                self.gui_queue.put(("show_error", f"Failed to load identity from keyring: Data format error (missing {e})."))
                 self._cleanup_temp_files()
                 self.identity_loaded_from_keyring = False
-                self.keyring_has_user_identity = False # Could be corrupted
+                self.keyring_has_user_identity = False
+            except Exception as e:
+                self._log_message(f"Error processing identity from keyring: {e}", constants.LOG_LEVEL_ERROR)
+                self.gui_queue.put(("show_error", f"Failed to load identity from keyring:\n{e}"))
+                self._cleanup_temp_files()
+                self.identity_loaded_from_keyring = False
+                self.keyring_has_user_identity = False # Could be partially loaded then failed
         else:
-            self._log_message(f"No identity in keyring or error: {msg}", constants.LOG_LEVEL_DEBUG)
-            self.keyring_has_user_identity = False
-        # Button states will be updated by _show_identities_view or _update_status_display
+            self._log_message("No saved identity found in keyring or error retrieving it.", constants.LOG_LEVEL_INFO)
+            # Message from utils.get_identity_from_keyring() was already logged
+            self.keyring_has_user_identity = False # Ensure this is set if identity_dict is None
+        gui.update_identity_persistence_buttons_state(self)
+
 
     def _save_current_identity_to_keyring(self):
+        """Saves the currently loaded valid identity to the system keyring."""
         if not self.certs_loaded_correctly:
-            self.gui_queue.put(("show_error", "No valid identity loaded to save.")); return
-        try:
-            with open(self.ca_cert_path.get(), 'r') as f: ca_pem = f.read()
-            with open(self.client_cert_path.get(), 'r') as f: cert_pem = f.read()
-            with open(self.client_key_path.get(), 'r') as f: key_pem = f.read()
+            self.gui_queue.put(("show_error", "Cannot save: No valid identity loaded."))
+            return
+        if self.identity_loaded_from_keyring:
+            self.gui_queue.put(("show_info", "This identity is already loaded from the keyring."))
+            return
+        if self.is_transferring:
+            self.gui_queue.put(("show_error", "Cannot save identity during an active transfer."))
+            return
 
-            success, msg = utils.save_identity_to_keyring(ca_pem, cert_pem, key_pem, self.ca_cert_display_name.get(), self.client_cert_display_name.get(), self.client_key_display_name.get())
+        try:
+            with open(self.ca_cert_path.get(), "r") as f: ca_pem = f.read()
+            with open(self.client_cert_path.get(), "r") as f: client_cert_pem = f.read()
+            with open(self.client_key_path.get(), "r") as f: client_key_pem = f.read()
+
+            # Pass display names as individual arguments
+            ca_disp_name = self.ca_cert_display_name.get()
+            client_cert_disp_name = self.client_cert_display_name.get()
+            client_key_disp_name = self.client_key_display_name.get()
+
+            success, msg = utils.save_identity_to_keyring(
+                ca_pem, client_cert_pem, client_key_pem,
+                ca_disp_name, client_cert_disp_name, client_key_disp_name
+            )
             if success:
                 self._log_message(f"Identity saved to keyring: {msg}", constants.LOG_LEVEL_INFO)
                 self.gui_queue.put(("show_info", "Current identity saved to system keyring."))
-                self.identity_loaded_from_keyring = True # Mark as "from keyring" now
+                self.identity_loaded_from_keyring = True # Mark as if loaded from keyring now
                 self.keyring_has_user_identity = True
+                gui.visual_feedback(self, self.save_identity_button, "Save to Keyring", "Saved!")
             else:
                 self._log_message(f"Failed to save identity to keyring: {msg}", constants.LOG_LEVEL_ERROR)
                 self.gui_queue.put(("show_error", f"Failed to save identity:\n{msg}"))
+        except OSError as e:
+            self._log_message(f"Error reading certificate files for keyring save: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"Error reading certificate files:\n{e}"))
         except Exception as e:
-            self._log_message(f"Error preparing to save identity: {e}", constants.LOG_LEVEL_ERROR)
-            self.gui_queue.put(("show_error", f"Error saving identity:\n{e}"))
-        self._update_identity_persistence_buttons_state()
+            self._log_message(f"Unexpected error saving identity to keyring: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"Unexpected error saving identity:\n{e}"))
+        finally:
+            gui.update_identity_persistence_buttons_state(self)
+
 
     def _clear_identity_from_keyring_action(self):
-        if messagebox.askyesno("Confirm Clear Identity", "Are you sure you want to remove the stored CryptLink identity from your system keyring?", parent=self.root):
+        """Clears the saved user identity from the system keyring."""
+        if self.is_transferring:
+            self.gui_queue.put(("show_error", "Cannot clear identity during an active transfer."))
+            return
+
+        if messagebox.askyesno("Confirm Clear Identity",
+                               "Are you sure you want to remove the saved CryptLink user identity "
+                               "from your system keyring?\n\nThis will not affect currently loaded certificates, "
+                               "only the persisted identity.", icon='warning', parent=self.root):
             success, msg = utils.clear_identity_from_keyring()
             if success:
                 self._log_message(f"Identity cleared from keyring: {msg}", constants.LOG_LEVEL_INFO)
-                self.gui_queue.put(("show_info", "Identity cleared from system keyring."))
+                self.gui_queue.put(("show_info", "Saved identity cleared from system keyring."))
                 self.keyring_has_user_identity = False
-                if self.identity_loaded_from_keyring: # If the current certs were from keyring
-                    self._cleanup_temp_files()
-                    self.ca_cert_path.set(""); self.client_cert_path.set(""); self.client_key_path.set("")
-                    self.ca_cert_display_name.set(""); self.client_cert_display_name.set(""); self.client_key_display_name.set("")
-                    self.certs_loaded_correctly = False; self.identity_loaded_from_keyring = False
-                    self.gui_queue.put(("status", "No Certs")); self._update_local_info(); self._check_enable_load_certs()
+                if self.identity_loaded_from_keyring: # If current identity was from keyring
+                    self.identity_loaded_from_keyring = False # It's no longer "from keyring"
+                gui.visual_feedback(self, self.clear_identity_button, "Clear from Keyring", "Cleared!")
             else:
-                self._log_message(f"Failed to clear identity from keyring: {msg}", constants.LOG_LEVEL_ERROR)
-                self.gui_queue.put(("show_error", f"Failed to clear identity:\n{msg}"))
-        self._update_identity_persistence_buttons_state()
+                self._log_message(f"Issue clearing identity from keyring: {msg}", constants.LOG_LEVEL_WARN)
+                self.gui_queue.put(("show_warning", f"Could not clear identity (it might not have existed):\n{msg}"))
+            gui.update_identity_persistence_buttons_state(self)
+        else:
+            self._log_message("User cancelled identity clearing from keyring.", constants.LOG_LEVEL_INFO)
 
-    def _update_identity_persistence_buttons_state(self):
-        if not hasattr(self, 'save_identity_button') or not self.save_identity_button.winfo_exists():
-            return # Widgets not ready
 
-        can_save = self.certs_loaded_correctly and not self.identity_loaded_from_keyring
-        self.save_identity_button.config(state='normal' if can_save else 'disabled')
-        self.clear_identity_button.config(state='normal' if self.keyring_has_user_identity else 'disabled')
+    def run(self):
+        """Starts the Tkinter main loop and server thread."""
+        self._start_server_if_needed() # Start server listening if certs are ready
+        self.root.mainloop()
 
-    # --- Application Exit ---
     def _quit_app(self):
-        self._log_message("Quit requested.")
-        if hasattr(self, '_quitting') and self._quitting: return
-        self._quitting = True
-        if self.certs_loaded_correctly and not self.identity_loaded_from_keyring and not self.bundle_exported_this_session:
-            if messagebox.askyesno("Export Bundle Before Quitting?","Do you want to export the current certificates to an encrypted bundle before quitting?\n\n(This makes loading them easier next time.)",parent=self.root):
-                try: self._export_bundle()
-                except Exception as e: self._log_message(f"Error during export on quit: {e}", constants.LOG_LEVEL_ERROR); messagebox.showerror("Export Error", f"Could not export bundle before quitting:\n{e}", parent=self.root)
-        if self.is_connected or self.is_connecting:
-            self._disconnect_peer(reason="Application quitting", notify_peer=True)
-            time.sleep(0.2)
-        self._stop_server()
-        if self.heartbeat_timer: self.heartbeat_timer.cancel()
-        if self.sender_status_clear_timer: self.sender_status_clear_timer.cancel()
-        if hasattr(self, '_after_id_queue') and self._after_id_queue:
-            try:
-                self.root.after_cancel(self._after_id_queue)
-            except tk.TclError:
-                pass
-            self._after_id_queue = None
+        """Handles application shutdown."""
+        self._log_message("Quit command received. Shutting down...", constants.LOG_LEVEL_INFO)
+        if self.is_transferring:
+            if not messagebox.askyesno("Confirm Quit", "A file transfer is in progress. Are you sure you want to quit?", parent=self.root):
+                self._log_message("Quit cancelled by user due to active transfer.", constants.LOG_LEVEL_INFO)
+                return
+
+        # Prompt to save bundle if certs were manually loaded and not saved/exported
+        if self.certs_loaded_correctly and not self.loaded_from_bundle and \
+           not self.bundle_exported_this_session and not self.identity_loaded_from_keyring:
+            if messagebox.askyesno("Save Certificates?",
+                                   "You have manually loaded certificates that have not been exported to a bundle or saved to keyring.\n"
+                                   "Do you want to export them to a bundle now?", parent=self.root):
+                gui.export_bundle_dialog(self) # This is a GUI function
+
+        self.stop_event.set() # Signal all threads to stop
+
+        if self.is_connected:
+            self._disconnect_peer(reason="Application quitting")
+
+        if self.server_socket:
+            try: self.server_socket.close()
+            except: pass
+            self.server_socket = None
+        if self.server_thread and self.server_thread.is_alive():
+            self.server_thread.join(timeout=2)
+            if self.server_thread.is_alive():
+                 self._log_message("Server thread did not shut down cleanly.", constants.LOG_LEVEL_WARN)
+
+        if self.client_connection_thread and self.client_connection_thread.is_alive():
+             self.client_connection_thread.join(timeout=1) # Usually short-lived
+
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join(timeout=1)
+
         self._cleanup_temp_files()
-        self._log_message("Exiting application.")
-        self.root.destroy()
+
+        # Cancel any pending GUI updates via root.after
+        # This is tricky; Tkinter doesn't have a direct way to cancel all.
+        # Destroying the root window handles this.
+        if self.root:
+            self.root.destroy()
+        self._log_message("Application shut down.", constants.LOG_LEVEL_INFO)
+        sys.exit(0)

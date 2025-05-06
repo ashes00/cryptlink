@@ -135,6 +135,21 @@ def format_bytes(size):
     else:
         return f"{size/1024**3:.2f} GB"
 
+def format_eta(seconds):
+    """Formats seconds into a human-readable ETA string (HH:MM:SS or MM:SS)."""
+    if not isinstance(seconds, (int, float)) or seconds < 0:
+        return "N/A"
+    if seconds == float('inf') or seconds > 3600 * 24 * 7: # More than a week, consider it "forever"
+        return "Unknown"
+
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
 def get_downloads_folder():
     """Gets the default Downloads folder path for the current OS."""
     try:
