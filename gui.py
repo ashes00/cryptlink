@@ -17,6 +17,7 @@ try:
     # These modules are expected to be in the same directory or Python path
     import constants
     import utils # utils.py will contain general utilities
+    import settings # For create_settings_widgets
 except ImportError as e:
     # This basic error handling is for when gui.py itself is run or imported
     # in an environment where its siblings aren't found.
@@ -44,6 +45,7 @@ def create_widgets(app):
     app.menu_bar.add_command(label="Home", command=lambda: show_main_view(app), state='disabled')
     app.menu_bar.add_command(label="Identities", command=lambda: show_identities_view(app), state='normal')
     app.menu_bar.add_command(label="Admin Tools", command=lambda: show_admin_tools_view(app), state='normal')
+    app.menu_bar.add_command(label="Settings", command=lambda: show_settings_view(app), state='normal')
 
     # --- Main Frame Setup (2 Columns) ---
     main_frame = ttk.Frame(app.root, padding="10")
@@ -197,6 +199,10 @@ def create_widgets(app):
 
     app.admin_generate_bundle_button = ttk.Button(client_admin_frame, text="Generate Bundle", command=lambda: admin_generate_bundle(app), state='disabled')
     app.admin_generate_bundle_button.grid(row=1, column=0, columnspan=2, padx=5, pady=5)
+
+    # --- Settings View Frame (created by settings.py, initially hidden) ---
+    # The actual settings_frame is created and returned by settings.create_settings_widgets
+    app.settings_view_frame_container = settings.create_settings_widgets(app, left_frame)
 
     # --- Quit Button (always visible at the bottom of left_frame) ---
     app.quit_button = ttk.Button(left_frame, text="Quit", command=app._quit_app)
@@ -870,6 +876,7 @@ def show_main_view(app):
         if hasattr(app, 'cert_frame'): app.cert_frame.grid_forget()
         if hasattr(app, 'identity_persistence_frame'): app.identity_persistence_frame.grid_forget()
         if hasattr(app, 'admin_tools_frame'): app.admin_tools_frame.grid_forget()
+        if hasattr(app, 'settings_view_frame_container') and app.settings_view_frame_container: app.settings_view_frame_container.grid_forget()
 
         # Show main view widgets in left_frame
         if hasattr(app, 'conn_frame'): app.conn_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5) # Use tk.W, tk.E for full width
@@ -884,6 +891,7 @@ def show_main_view(app):
         app.menu_bar.entryconfig("Home", state='disabled')
         app.menu_bar.entryconfig("Identities", state='normal')
         app.menu_bar.entryconfig("Admin Tools", state='normal')
+        app.menu_bar.entryconfig("Settings", state='normal')
         app._log_message("Switched to Main View.", constants.LOG_LEVEL_DEBUG)
         update_status_display(app) # Refresh button states
     except AttributeError as e:
@@ -898,6 +906,7 @@ def show_identities_view(app):
         if hasattr(app, 'status_frame'): app.status_frame.grid_forget()
         if hasattr(app, 'transfer_frame'): app.transfer_frame.grid_forget()
         if hasattr(app, 'admin_tools_frame'): app.admin_tools_frame.grid_forget()
+        if hasattr(app, 'settings_view_frame_container') and app.settings_view_frame_container: app.settings_view_frame_container.grid_forget()
         # Keep right column (received files, logs) visible
         if hasattr(app, 'received_frame'): app.received_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5))
         if hasattr(app, 'log_frame_outer'): app.log_frame_outer.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5, 0))
@@ -912,6 +921,7 @@ def show_identities_view(app):
         app.menu_bar.entryconfig("Home", state='normal')
         app.menu_bar.entryconfig("Identities", state='disabled')
         app.menu_bar.entryconfig("Admin Tools", state='normal')
+        app.menu_bar.entryconfig("Settings", state='normal')
         app._log_message("Switched to Identities View.", constants.LOG_LEVEL_DEBUG)
     except AttributeError as e:
         app._log_message(f"Error switching to Identities View (widgets might not be fully initialized): {e}", constants.LOG_LEVEL_WARN)
@@ -926,6 +936,7 @@ def show_admin_tools_view(app):
         if hasattr(app, 'transfer_frame'): app.transfer_frame.grid_forget()
         if hasattr(app, 'cert_frame'): app.cert_frame.grid_forget()
         if hasattr(app, 'identity_persistence_frame'): app.identity_persistence_frame.grid_forget()
+        if hasattr(app, 'settings_view_frame_container') and app.settings_view_frame_container: app.settings_view_frame_container.grid_forget()
         # Keep right column (received files, logs) visible
         if hasattr(app, 'received_frame'): app.received_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5))
         if hasattr(app, 'log_frame_outer'): app.log_frame_outer.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5, 0))
@@ -939,9 +950,36 @@ def show_admin_tools_view(app):
         app.menu_bar.entryconfig("Home", state='normal')
         app.menu_bar.entryconfig("Identities", state='normal')
         app.menu_bar.entryconfig("Admin Tools", state='disabled')
+        app.menu_bar.entryconfig("Settings", state='normal')
         app._log_message("Switched to Admin Tools View.", constants.LOG_LEVEL_DEBUG)
     except AttributeError as e:
         app._log_message(f"Error switching to Admin Tools View (widgets might not be fully initialized): {e}", constants.LOG_LEVEL_WARN)
+
+def show_settings_view(app):
+    """Shows the settings view, hides others."""
+    try:
+        # Hide other views' main frames
+        if hasattr(app, 'conn_frame'): app.conn_frame.grid_forget()
+        if hasattr(app, 'status_frame'): app.status_frame.grid_forget()
+        if hasattr(app, 'transfer_frame'): app.transfer_frame.grid_forget()
+        if hasattr(app, 'cert_frame'): app.cert_frame.grid_forget()
+        if hasattr(app, 'identity_persistence_frame'): app.identity_persistence_frame.grid_forget()
+        if hasattr(app, 'admin_tools_frame'): app.admin_tools_frame.grid_forget()
+        # Keep right column (received files, logs) visible
+        if hasattr(app, 'received_frame'): app.received_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5))
+        if hasattr(app, 'log_frame_outer'): app.log_frame_outer.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5, 0))
+
+        # Show settings frame in left_frame
+        if hasattr(app, 'settings_view_frame_container') and app.settings_view_frame_container:
+            app.settings_view_frame_container.grid(row=0, column=0, rowspan=4, sticky=(tk.W, tk.E, tk.N), pady=5) # rowspan to occupy similar space
+
+        app.menu_bar.entryconfig("Home", state='normal')
+        app.menu_bar.entryconfig("Identities", state='normal')
+        app.menu_bar.entryconfig("Admin Tools", state='normal')
+        app.menu_bar.entryconfig("Settings", state='disabled')
+        app._log_message("Switched to Settings View.", constants.LOG_LEVEL_DEBUG)
+    except AttributeError as e:
+        app._log_message(f"Error switching to Settings View (widgets might not be fully initialized): {e}", constants.LOG_LEVEL_WARN)
 
 
 def update_identity_persistence_buttons_state(app):

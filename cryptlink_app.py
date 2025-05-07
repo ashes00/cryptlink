@@ -134,12 +134,18 @@ class CryptLinkApp:
         self.admin_ca_cert = None # Stores loaded CA cert (PEM bytes) for admin use
         self.admin_ca_key = None  # Stores loaded CA key (PEM bytes) for admin use
 
+        # --- Application Settings ---
+        self.app_settings = {} # Will be loaded from file
+        self.logging_verbosity_var = tk.StringVar() # For the settings UI
+        self._load_app_settings() # Load settings on startup
+
         # --- Create GUI Widgets (delegated to gui.py) ---
         gui.create_widgets(self) # Pass self (app instance) to gui functions
 
         # --- Initial Setup ---
         gui.update_local_info(self)
         self._load_identity_from_keyring_on_startup() # Attempt to load saved identity
+        # gui.set_connection_status will be called by _load_identity_from_keyring_on_startup or if it fails
         if not self.certs_loaded_correctly:
             gui.set_connection_status(self, "No Certs")
 
@@ -1409,6 +1415,54 @@ class CryptLinkApp:
         else:
             self._log_message("User cancelled identity clearing from keyring.", constants.LOG_LEVEL_INFO)
 
+
+    def _load_app_settings(self):
+        """Loads application settings from the JSON file."""
+        try:
+            if os.path.exists(constants.SETTINGS_FILE_PATH):
+                with open(constants.SETTINGS_FILE_PATH, 'r') as f:
+                    self.app_settings = json.load(f)
+                self._log_message(f"Loaded settings from {constants.SETTINGS_FILE_PATH}", constants.LOG_LEVEL_DEBUG)
+            else:
+                self._log_message(f"Settings file not found at {constants.SETTINGS_FILE_PATH}. Using defaults.", constants.LOG_LEVEL_INFO)
+                self.app_settings = {} # Start with empty, defaults will apply
+
+        except (json.JSONDecodeError, OSError) as e:
+            self._log_message(f"Error loading settings file: {e}. Using defaults.", constants.LOG_LEVEL_ERROR)
+            self.app_settings = {} # Reset to defaults on error
+
+        # Apply loaded settings or defaults
+        loaded_log_level_str = self.app_settings.get("logging_level", constants.DEFAULT_LOGGING_LEVEL_STR)
+        
+        # Ensure constants.CURRENT_LOG_LEVEL is updated correctly
+        # This needs to be done carefully as constants are module-level.
+        # The best way is to re-import or modify the constant if the module structure allows.
+        # For now, we'll update it directly, assuming this is the main control point.
+        constants.CURRENT_LOG_LEVEL = constants.LOG_LEVEL_MAP.get(loaded_log_level_str, constants.LOG_LEVEL_MAP[constants.DEFAULT_LOGGING_LEVEL_STR])
+        
+        self.logging_verbosity_var.set(loaded_log_level_str) # Update Tkinter variable for UI
+        self._log_message(f"Logging level set to: {loaded_log_level_str} (numeric: {constants.CURRENT_LOG_LEVEL})", constants.LOG_LEVEL_INFO)
+
+
+    def _save_app_settings(self):
+        """Saves current application settings to the JSON file."""
+        # Update self.app_settings from UI variables
+        new_log_level_str = self.logging_verbosity_var.get()
+        self.app_settings["logging_level"] = new_log_level_str
+
+        # Apply the new logging level immediately
+        constants.CURRENT_LOG_LEVEL = constants.LOG_LEVEL_MAP.get(new_log_level_str, constants.LOG_LEVEL_MAP[constants.DEFAULT_LOGGING_LEVEL_STR])
+        self._log_message(f"Logging level changed to: {new_log_level_str} (numeric: {constants.CURRENT_LOG_LEVEL})", constants.LOG_LEVEL_INFO)
+
+        try:
+            os.makedirs(os.path.dirname(constants.SETTINGS_FILE_PATH), exist_ok=True)
+            with open(constants.SETTINGS_FILE_PATH, 'w') as f:
+                json.dump(self.app_settings, f, indent=4)
+            self._log_message(f"Settings saved to {constants.SETTINGS_FILE_PATH}", constants.LOG_LEVEL_INFO)
+            gui.visual_feedback(self, self.save_settings_button, "Save Settings", "Saved!") # Assumes save_settings_button exists on app
+        except OSError as e:
+            self._log_message(f"Error saving settings file: {e}", constants.LOG_LEVEL_ERROR)
+            self.gui_queue.put(("show_error", f"Could not save settings:\n{e}"))
 
     def run(self):
         """Starts the Tkinter main loop and server thread."""
