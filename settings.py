@@ -52,11 +52,24 @@ def create_settings_widgets(app, parent_frame):
         # The actual application of this default to constants.CURRENT_LOG_LEVEL happens in _load_app_settings.
         app.logging_verbosity_var.set(constants.DEFAULT_LOGGING_LEVEL_STR)
 
+    # --- Identity Settings ---
+    identity_settings_frame = ttk.LabelFrame(app.settings_frame, text="Identity Settings", padding="10")
+    identity_settings_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N), padx=5, pady=5)
+    identity_settings_frame.columnconfigure(0, weight=1) # Allow checkbox to align well
+
+    # Ensure app.manual_id_config_enabled_var is initialized in CryptLinkApp.__init__
+    # It should be a tk.BooleanVar()
+    app.manual_id_config_checkbutton = ttk.Checkbutton(
+        identity_settings_frame,
+        text="Enable Manual Identity Configuration",
+        variable=app.manual_id_config_enabled_var,
+        onvalue=True,
+        offvalue=False
+    )
+    app.manual_id_config_checkbutton.grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+
 
     # --- Add more settings sections here in the future ---
-    # Example:
-    # network_frame = ttk.LabelFrame(app.settings_frame, text="Network Settings", padding="10")
-    # network_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N), padx=5, pady=5)
 
     # --- Save Button ---
     # Place it at the bottom of app.settings_frame, spanning columns if necessary

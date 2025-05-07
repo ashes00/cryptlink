@@ -71,23 +71,35 @@ def create_widgets(app):
     # Gridded later by show_identities_view
     app.cert_frame.columnconfigure(1, weight=1)
 
-    ttk.Button(app.cert_frame, text="CA Cert", command=lambda: select_ca(app)).grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
+    app.ca_cert_button = ttk.Button(app.cert_frame, text="CA Cert", command=lambda: select_ca(app))
+    app.ca_cert_button._grid_options = {"row": 0, "column": 0, "padx": 5, "pady": 2, "sticky": tk.W}
+    app.ca_cert_button.grid(**app.ca_cert_button._grid_options)
     app.ca_entry = ttk.Entry(app.cert_frame, textvariable=app.ca_cert_display_name, state='readonly', width=20)
-    app.ca_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
+    app.ca_entry._grid_options = {"row": 0, "column": 1, "sticky": (tk.W, tk.E), "padx": 5, "pady": 2}
+    app.ca_entry.grid(**app.ca_entry._grid_options)
     app.save_certs_button = ttk.Button(app.cert_frame, text="Load Certs", command=app._save_certs, state='disabled')
-    app.save_certs_button.grid(row=0, column=2, padx=5, pady=2, sticky=tk.E)
+    app.save_certs_button._grid_options = {"row": 0, "column": 2, "padx": 5, "pady": 2, "sticky": tk.E}
+    app.save_certs_button.grid(**app.save_certs_button._grid_options)
 
-    ttk.Button(app.cert_frame, text="Client Cert", command=lambda: select_cert(app)).grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
+    app.client_cert_button = ttk.Button(app.cert_frame, text="Client Cert", command=lambda: select_cert(app))
+    app.client_cert_button._grid_options = {"row": 1, "column": 0, "padx": 5, "pady": 2, "sticky": tk.W}
+    app.client_cert_button.grid(**app.client_cert_button._grid_options)
     app.cert_entry = ttk.Entry(app.cert_frame, textvariable=app.client_cert_display_name, state='readonly', width=20)
-    app.cert_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
+    app.cert_entry._grid_options = {"row": 1, "column": 1, "sticky": (tk.W, tk.E), "padx": 5, "pady": 2}
+    app.cert_entry.grid(**app.cert_entry._grid_options)
     app.export_bundle_button = ttk.Button(app.cert_frame, text="Export Bundle", command=lambda: export_bundle_dialog(app), state='disabled')
-    app.export_bundle_button.grid(row=1, column=2, padx=5, pady=2, sticky=tk.E)
+    app.export_bundle_button._grid_options = {"row": 1, "column": 2, "padx": 5, "pady": 2, "sticky": tk.E}
+    app.export_bundle_button.grid(**app.export_bundle_button._grid_options)
 
-    ttk.Button(app.cert_frame, text="Client Key", command=lambda: select_key(app)).grid(row=2, column=0, padx=5, pady=2, sticky=tk.W)
+    app.client_key_button = ttk.Button(app.cert_frame, text="Client Key", command=lambda: select_key(app))
+    app.client_key_button._grid_options = {"row": 2, "column": 0, "padx": 5, "pady": 2, "sticky": tk.W}
+    app.client_key_button.grid(**app.client_key_button._grid_options)
     app.key_entry = ttk.Entry(app.cert_frame, textvariable=app.client_key_display_name, state='readonly', width=20)
-    app.key_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
+    app.key_entry._grid_options = {"row": 2, "column": 1, "sticky": (tk.W, tk.E), "padx": 5, "pady": 2}
+    app.key_entry.grid(**app.key_entry._grid_options)
     app.import_bundle_button = ttk.Button(app.cert_frame, text="Import Bundle", command=lambda: import_bundle_dialog(app), state='normal')
-    app.import_bundle_button.grid(row=2, column=2, padx=5, pady=2, sticky=tk.E)
+    app.import_bundle_button._grid_options = {"row": 2, "column": 2, "padx": 5, "pady": 2, "sticky": tk.E} # Store for consistency if ever needed
+    app.import_bundle_button.grid(**app.import_bundle_button._grid_options)
 
     # --- Identity Persistence Section (for Identities View) ---
     app.identity_persistence_frame = ttk.LabelFrame(left_frame, text="Identity Persistence (Keyring)", padding="10")
@@ -247,6 +259,7 @@ def create_widgets(app):
 
     # Set initial view
     show_main_view(app)
+    update_identities_view_visibility(app) # Set initial visibility based on loaded settings
 
 
 def update_log_widget(app, log_entry):
@@ -916,6 +929,7 @@ def show_identities_view(app):
         if hasattr(app, 'cert_frame'): app.cert_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
         if hasattr(app, 'identity_persistence_frame'): app.identity_persistence_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
         update_identity_persistence_buttons_state(app)
+        update_identities_view_visibility(app) # Ensure visibility is correct when view is shown
 
         # Update menu state
         app.menu_bar.entryconfig("Home", state='normal')
@@ -997,3 +1011,46 @@ def reset_transfer_ui(app):
     """Resets transfer-related UI elements to their default state."""
     app.gui_queue.put(("progress", (0, "Speed: N/A", "ETA: N/A")))
     # The sender status message will be cleared by its own timer if it was set as temporary.
+
+
+def update_identities_view_visibility(app):
+    """
+    Updates the visibility of manual certificate configuration elements
+    based on the 'Manual Identity Configuration' setting.
+    """
+    if not hasattr(app, 'cert_frame') or not app.cert_frame.winfo_exists():
+        return # Widgets not ready
+
+    manual_config_enabled = app.manual_id_config_enabled_var.get()
+
+    elements_to_toggle = [
+        app.ca_cert_button, app.ca_entry,
+        app.client_cert_button, app.cert_entry,
+        app.client_key_button, app.key_entry,
+        app.save_certs_button,
+        app.export_bundle_button
+    ]
+
+    for widget in elements_to_toggle:
+        if not hasattr(widget, 'winfo_exists') or not widget.winfo_exists(): # Check if widget is valid
+            app._log_message(f"Warning: Widget {widget} not found or destroyed during visibility update.", constants.LOG_LEVEL_WARN)
+            continue
+        if manual_config_enabled:
+            # Enable the widget. Buttons become 'normal', Entries become 'readonly'.
+            if isinstance(widget, ttk.Entry):
+                widget.config(state='readonly')
+            else: # Assuming buttons
+                widget.config(state='normal')
+        else:
+            # Disable the widget
+            widget.config(state='disabled')
+
+    # Ensure Import Bundle button is always visible and enabled (if not connected)
+    if hasattr(app, 'import_bundle_button') and app.import_bundle_button.winfo_exists():
+        app.import_bundle_button.config(state=tk.NORMAL if not (app.is_connected or app.is_connecting) else tk.DISABLED)
+
+    # Re-check button states based on current cert status if manual config is enabled
+    if manual_config_enabled:
+        check_enable_load_certs(app)
+    # If manual_config_enabled is False, the loop above already disabled save_certs_button and export_bundle_button.
+    # If it's True, check_enable_load_certs() will set their state appropriately.

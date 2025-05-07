@@ -137,6 +137,7 @@ class CryptLinkApp:
         # --- Application Settings ---
         self.app_settings = {} # Will be loaded from file
         self.logging_verbosity_var = tk.StringVar() # For the settings UI
+        self.manual_id_config_enabled_var = tk.BooleanVar(value=False) # Default to False
         self._load_app_settings() # Load settings on startup
 
         # --- Create GUI Widgets (delegated to gui.py) ---
@@ -1443,16 +1444,24 @@ class CryptLinkApp:
         self.logging_verbosity_var.set(loaded_log_level_str) # Update Tkinter variable for UI
         self._log_message(f"Logging level set to: {loaded_log_level_str} (numeric: {constants.CURRENT_LOG_LEVEL})", constants.LOG_LEVEL_INFO)
 
+        # Load Manual Identity Configuration setting
+        manual_id_config_enabled = self.app_settings.get("manual_id_config_enabled", False) # Default to False
+        self.manual_id_config_enabled_var.set(manual_id_config_enabled)
+
 
     def _save_app_settings(self):
         """Saves current application settings to the JSON file."""
         # Update self.app_settings from UI variables
         new_log_level_str = self.logging_verbosity_var.get()
         self.app_settings["logging_level"] = new_log_level_str
+        self.app_settings["manual_id_config_enabled"] = self.manual_id_config_enabled_var.get()
 
         # Apply the new logging level immediately
         constants.CURRENT_LOG_LEVEL = constants.LOG_LEVEL_MAP.get(new_log_level_str, constants.LOG_LEVEL_MAP[constants.DEFAULT_LOGGING_LEVEL_STR])
         self._log_message(f"Logging level changed to: {new_log_level_str} (numeric: {constants.CURRENT_LOG_LEVEL})", constants.LOG_LEVEL_INFO)
+        self._log_message(f"Manual Identity Configuration set to: {self.manual_id_config_enabled_var.get()}", constants.LOG_LEVEL_INFO)
+
+        gui.update_identities_view_visibility(self) # Update Identities view based on new setting
 
         try:
             os.makedirs(os.path.dirname(constants.SETTINGS_FILE_PATH), exist_ok=True)
