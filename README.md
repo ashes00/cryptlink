@@ -7,6 +7,7 @@
 
 **CryptLink** is a desktop application designed for secure peer-to-peer (P2P) file transfers. It utilizes TLS encryption and certificate-based authentication to ensure that your files are exchanged privately and securely directly between two trusted parties, without relying on intermediary cloud services.
 **Important Note:** CryptLink is primarily designed for use between peers on the same Local Area Network (LAN) or connected via a Virtual Private Network (VPN) that allows them to reach each other directly by IP address or hostname. It does not include NAT traversal or relay servers for connecting peers across separate, disconnected internet networks without a VPN.
+**Notice:**  CryptLink was created with the assistance of Generative AI.
 ## ✨ Features
 
 *   **Secure P2P Transfers**: Files are sent directly between users over an encrypted TLS channel.
