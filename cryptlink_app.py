@@ -1481,6 +1481,26 @@ class CryptLinkApp:
         else:
             self._log_message("User cancelled identity clearing from keyring.", constants.LOG_LEVEL_INFO)
 
+    def _clear_remembered_peers_action(self):
+        """Clears the list of remembered peers after confirmation."""
+        if not self.remembered_peers:
+            self.gui_queue.put(("show_info", "There are no past connections to clear."))
+            self._log_message("Attempted to clear past connections, but list is already empty.", constants.LOG_LEVEL_INFO)
+            return
+
+        if messagebox.askyesno("Confirm Clear",
+                               "Are you sure you want to clear all past connection history?",
+                               parent=self.root):
+            self._log_message("User confirmed clearing past connection history.", constants.LOG_LEVEL_INFO)
+            self.remembered_peers = []
+            self._save_app_settings() # Save immediately
+            self.gui_queue.put(("update_peer_list_dropdown", None)) # Update GUI
+            self.gui_queue.put(("show_info", "Past connection history has been cleared."))
+            # Optional: Visual feedback on the button if we pass it or have a reference
+            # For now, the info message and log should suffice.
+        else:
+            self._log_message("User cancelled clearing past connection history.", constants.LOG_LEVEL_INFO)
+
 
     def _load_app_settings(self):
         """Loads application settings from the JSON file."""

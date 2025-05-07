@@ -70,6 +70,16 @@ def create_settings_widgets(app, parent_frame):
 
 
     # --- Add more settings sections here in the future ---
+    connection_history_frame = ttk.LabelFrame(app.settings_frame, text="Connection History", padding="10")
+    connection_history_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N), padx=5, pady=5) # Placed at row 2
+    connection_history_frame.columnconfigure(0, weight=1) # Allow button to align well
+
+    app.clear_past_connections_button = ttk.Button(
+        connection_history_frame,
+        text="Clear Past Connections",
+        command=app._clear_remembered_peers_action # This method will be in CryptLinkApp
+    )
+    app.clear_past_connections_button.grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
 
     # --- Save Button ---
     # Place it at the bottom of app.settings_frame, spanning columns if necessary
