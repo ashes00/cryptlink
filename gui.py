@@ -123,8 +123,15 @@ def create_widgets(app):
     app.conn_frame.columnconfigure(1, weight=1)
 
     ttk.Label(app.conn_frame, text="Peer IP/Host:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
-    app.peer_entry = ttk.Entry(app.conn_frame, textvariable=app.peer_ip_hostname, state='disabled', width=7)
+    # Changed from Entry to Combobox
+    app.peer_entry = ttk.Combobox(
+        app.conn_frame,
+        textvariable=app.peer_ip_hostname,
+        state='disabled', # Initial state
+        width=20 # Adjust width as needed
+    )
     app.peer_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
+    update_peer_list_dropdown(app) # Populate dropdown initially
 
     conn_button_frame = ttk.Frame(app.conn_frame)
     conn_button_frame.grid(row=1, column=1, columnspan=2, padx=5, pady=(2, 5), sticky=tk.E)
@@ -414,6 +421,19 @@ def revert_button_config(app, button, original_text, original_state):
         app._log_message(f"Info: Could not revert button config (widget likely destroyed): {e}", constants.LOG_LEVEL_DEBUG)
     except Exception as e:
         app._log_message(f"Error reverting button config: {e}", constants.LOG_LEVEL_ERROR)
+
+def update_peer_list_dropdown(app):
+    """Updates the values in the peer IP/Host dropdown based on remembered peers."""
+    if not hasattr(app, 'peer_entry') or not app.peer_entry.winfo_exists():
+        return # Widget not ready
+
+    display_list = []
+    for peer in app.remembered_peers:
+        hostname = peer.get('hostname')
+        ip = peer.get('ip')
+        display_list.append(f"{hostname} ({ip})" if hostname and hostname != "N/A" else ip)
+
+    app.peer_entry['values'] = display_list
 
 def check_enable_load_certs(app):
     """Enables or disables the 'Load Certs' and 'Export Bundle' buttons based on selections."""
@@ -1080,6 +1100,23 @@ def reset_transfer_ui(app):
     app.gui_queue.put(("progress", (0, "Speed: N/A", "ETA: N/A")))
     # The sender status message will be cleared by its own timer if it was set as temporary.
 
+
+def update_peer_list_dropdown(app):
+    """Updates the values in the peer IP/Host dropdown based on remembered peers."""
+    if not hasattr(app, 'peer_entry') or not app.peer_entry.winfo_exists():
+        return # Widget not ready
+
+    display_list = []
+    # Iterate through remembered_peers in reverse to show most recent at the top of the list
+    for peer in reversed(app.remembered_peers):
+        hostname = peer.get('hostname')
+        ip = peer.get('ip')
+        # Format as "Hostname (IP)" if hostname is available and not "N/A", otherwise just IP
+        display_text = f"{hostname} ({ip})" if hostname and hostname != "N/A" else ip
+        if display_text: # Avoid adding empty strings
+             display_list.append(display_text)
+
+    app.peer_entry['values'] = display_list
 
 def update_identities_view_visibility(app):
     """

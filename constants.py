@@ -33,6 +33,7 @@ SENDER_STATUS_DISPLAY_DURATION = 20000 # milliseconds (20 seconds)
 FILE_ACCEPT_TIMEOUT = 60.0 # Seconds to wait for user to accept/reject incoming file
 FILE_CHUNK_SIZE = 128 * 1024 # 128 KB chunks for file transfer
 MAX_CMD_LEN = 5 * 1024 * 1024 # Max length for JSON command messages (5MB) to prevent DoS
+MAX_REMEMBERED_PEERS = 10 # Maximum number of peers to remember in the dropdown
 
 # --- Logging ---
 LOG_LEVEL_DEBUG = 0
@@ -48,4 +49,3 @@ LOG_LEVEL_MAP = {
 }
 CURRENT_LOG_LEVEL = LOG_LEVEL_MAP[DEFAULT_LOGGING_LEVEL_STR] # Initial default
 SETTINGS_FILE_PATH = os.path.join(str(Path.home()), ".cryptlink", "settings.json")
-

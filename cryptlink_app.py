@@ -18,6 +18,7 @@ import datetime
 import base64
 import tempfile
 import hashlib
+import re # For parsing peer input string
 
 # --- Import Third-Party Libraries ---
 try:
@@ -96,6 +97,7 @@ class CryptLinkApp:
         self.transfer_speed = tk.StringVar(value="Speed: N/A")
         self.transfer_eta = tk.StringVar(value="ETA: N/A")
 
+        self.remembered_peers = [] # List of {'ip': '...', 'hostname': '...', 'fingerprint': '...'}
         self.certs_loaded_correctly = False
         self.bundle_exported_this_session = False # Track if current certs came from manual load and were then exported
         self.loaded_from_bundle = False # True if current certs were loaded from a .clb file
@@ -115,7 +117,7 @@ class CryptLinkApp:
         self.local_hostname = socket.gethostname()
         self.server_socket = None
         self.client_socket = None # Represents the active connection socket (either from server or client role)
-        self.ssl_context = None
+        # self.ssl_context = None # This is now created locally in server/client methods
         self.peer_info = {} # Store dict of peer's hostname, ip, fingerprint
         self.local_full_fingerprint = None
         self.peer_full_fingerprint = None
@@ -203,6 +205,8 @@ class CryptLinkApp:
                 elif msg_type == "prompt_fingerprint":
                     peer_fp_display, callback = data
                     self._verify_peer_fingerprint_dialog(peer_fp_display, callback)
+                elif msg_type == "update_peer_list_dropdown":
+                    gui.update_peer_list_dropdown(self) # Call the GUI function to update the dropdown
                 elif msg_type == "prompt_file_accept":
                     filename, filesize_str, callback = data
                     self._prompt_accept_file_dialog(filename, filesize_str, callback)
@@ -379,8 +383,9 @@ class CryptLinkApp:
 
     def _server_listen_loop(self):
         """Listens for incoming connections and handles them in new threads."""
-        self.ssl_context = self._create_ssl_context(purpose=ssl.Purpose.CLIENT_AUTH)
-        if not self.ssl_context:
+        # Create a local SSL context specifically for the server
+        server_ssl_context = self._create_ssl_context(purpose=ssl.Purpose.CLIENT_AUTH)
+        if not server_ssl_context: # Check if context creation failed
             self._log_message("Server cannot start: Failed to create SSL context.", constants.LOG_LEVEL_ERROR)
             gui.set_connection_status(self, "SSL Error")
             return
@@ -408,8 +413,8 @@ class CryptLinkApp:
 
                     self.is_connecting = True
                     self.gui_queue.put(("status", "Connecting"))
-                    # Pass the raw socket `conn` to _handle_client_connection
-                    threading.Thread(target=self._handle_client_connection, args=(conn, addr), daemon=True).start()
+                    # Pass the raw socket `conn` and the server_ssl_context to _handle_client_connection
+                    threading.Thread(target=self._handle_client_connection, args=(conn, addr, server_ssl_context), daemon=True).start()
                 except socket.timeout:
                     continue # Loop to check stop_event
                 except Exception as e:
@@ -428,14 +433,14 @@ class CryptLinkApp:
             if not self.is_connected and not self.is_connecting and self.certs_loaded_correctly:
                  self.gui_queue.put(("status", "Certs Loaded")) # Or Disconnected if it was previously connected
 
-    def _handle_client_connection(self, conn_socket, addr):
+    def _handle_client_connection(self, conn_socket, addr, server_context):
         """Handles an incoming client connection (SSL handshake, peer verification)."""
         peer_ip = addr[0]
         self.client_socket = None # Ensure it's clean before assignment
         self._log_message(f"SERVER_HANDLE: Thread started for {peer_ip}.", constants.LOG_LEVEL_DEBUG)
         try:
             self._log_message(f"SERVER_HANDLE: Attempting SSL wrap for {peer_ip}.", constants.LOG_LEVEL_DEBUG)
-            self.client_socket = self.ssl_context.wrap_socket(conn_socket, server_side=True)
+            self.client_socket = server_context.wrap_socket(conn_socket, server_side=True)
             self._log_message(f"SERVER_HANDLE: SSL handshake successful with {peer_ip}. Performing peer verification.", constants.LOG_LEVEL_DEBUG)
 
             # Exchange peer info (hostname, IP, cert fingerprint)
@@ -445,7 +450,7 @@ class CryptLinkApp:
                 self._log_message(f"SERVER_HANDLE: Could not get peer certificate from {peer_ip}.", constants.LOG_LEVEL_ERROR)
                 raise ssl.SSLError("Could not get peer certificate.")
             self._log_message(f"SERVER_HANDLE: Calculating peer fingerprint for {peer_ip}.", constants.LOG_LEVEL_DEBUG)
-            self.peer_full_fingerprint = hashlib.sha256(peer_cert).hexdigest()
+            self.peer_full_fingerprint = hashlib.sha256(peer_cert).hexdigest().upper() # Ensure upper for consistency
             peer_fp_display = utils.format_fingerprint_display(self.peer_full_fingerprint)
             self._log_message(f"SERVER_HANDLE: Peer {peer_ip} fingerprint: {peer_fp_display}", constants.LOG_LEVEL_DEBUG)
 
@@ -494,6 +499,14 @@ class CryptLinkApp:
                 self.gui_queue.put(("status", "Securely Connected"))
                 self._start_heartbeat()
                 self._communication_loop() # Start receiving commands
+                # For remembered peers, use the IP address the server actually saw the connection from (peer_ip)
+                # but keep the hostname and fingerprint from the PEER_INFO message.
+                info_to_remember = peer_info_cmd["data"].copy() # Make a copy to modify
+                info_to_remember["ip"] = peer_ip # Override with the observed incoming IP
+                self._log_message(f"SERVER_HANDLE: Storing remembered peer with observed IP {peer_ip}, "
+                                  f"original reported IP was {peer_info_cmd['data'].get('ip')}",
+                                  constants.LOG_LEVEL_DEBUG)
+                self._add_remembered_peer(info_to_remember)
             else: # User rejected
                 self._log_message("Peer fingerprint rejected by user.", constants.LOG_LEVEL_WARN)
                 self._send_command(self.client_socket, {"type": "VERIFICATION_REJECTED", "reason": "User rejected"})
@@ -532,9 +545,32 @@ class CryptLinkApp:
             self.gui_queue.put(("show_error", "Already connected or attempting to connect."))
             return
 
-        peer_host = self.peer_ip_hostname.get().strip()
-        if not peer_host:
+        peer_input_string = self.peer_ip_hostname.get().strip()
+        if not peer_input_string:
             self.gui_queue.put(("show_error", "Peer IP/Hostname cannot be empty."))
+            return
+
+        # Parse peer_input_string to get the actual target for connection
+        target_address_to_connect = ""
+        # Regex to find an IP address v4 pattern: xxx.xxx.xxx.xxx within the string
+        ip_pattern = r'\b((?:[0-9]{1,3}\.){3}[0-9]{1,3})\b' # Capture the IP
+        ip_match = re.search(ip_pattern, peer_input_string)
+
+        if ip_match:
+            target_address_to_connect = ip_match.group(1) # Get the captured IP address
+            self._log_message(f"Extracted IP '{target_address_to_connect}' from input '{peer_input_string}' for connection.", constants.LOG_LEVEL_DEBUG)
+        else:
+            # No IP found via regex. If it contains ' (', assume the part before it is a hostname.
+            # Otherwise, use the whole string (could be a hostname or a mistyped entry).
+            if ' (' in peer_input_string:
+                target_address_to_connect = peer_input_string.split(' (')[0].strip()
+                self._log_message(f"Extracted Hostname '{target_address_to_connect}' from input '{peer_input_string}' for connection.", constants.LOG_LEVEL_DEBUG)
+            else:
+                target_address_to_connect = peer_input_string
+                self._log_message(f"Using full input '{target_address_to_connect}' as target (hostname or IP).", constants.LOG_LEVEL_DEBUG)
+
+        if not target_address_to_connect: # Should not happen if peer_input_string was not empty
+            self.gui_queue.put(("show_error", "Could not parse Peer IP/Hostname."))
             return
 
         self.is_connecting = True
@@ -542,13 +578,13 @@ class CryptLinkApp:
         self.gui_queue.put(("clear_peer_info", None)) # Clear previous peer info
 
         # Run connection in a separate thread to keep GUI responsive
-        self.client_connection_thread = threading.Thread(target=self._initiate_connection, args=(peer_host,), daemon=True)
+        self.client_connection_thread = threading.Thread(target=self._initiate_connection, args=(target_address_to_connect,), daemon=True)
         self.client_connection_thread.start()
 
     def _initiate_connection(self, peer_host):
         """Core logic for establishing an outgoing TLS connection."""
-        self.ssl_context = self._create_ssl_context(purpose=ssl.Purpose.SERVER_AUTH)
-        if not self.ssl_context:
+        client_ssl_context = self._create_ssl_context(purpose=ssl.Purpose.SERVER_AUTH)
+        if not client_ssl_context:
             self._log_message("Client connection failed: Could not create SSL context.", constants.LOG_LEVEL_ERROR)
             self.is_connecting = False
             self.gui_queue.put(("status", "SSL Error"))
@@ -557,14 +593,14 @@ class CryptLinkApp:
         raw_socket = None
         try:
             raw_socket = socket.create_connection((peer_host, constants.DEFAULT_PORT), timeout=constants.CONNECTION_TIMEOUT)
-            self.client_socket = self.ssl_context.wrap_socket(raw_socket, server_hostname=peer_host) # server_hostname for SNI
+            self.client_socket = client_ssl_context.wrap_socket(raw_socket, server_hostname=peer_host) # server_hostname for SNI
             self._log_message(f"Successfully connected and SSL handshake complete with {peer_host}.", constants.LOG_LEVEL_DEBUG)
 
             # Exchange peer info
             peer_cert = self.client_socket.getpeercert(binary_form=True)
             if not peer_cert:
                 raise ssl.SSLError("Could not get peer certificate.")
-            self.peer_full_fingerprint = hashlib.sha256(peer_cert).hexdigest()
+            self.peer_full_fingerprint = hashlib.sha256(peer_cert).hexdigest().upper() # Ensure upper
             peer_fp_display = utils.format_fingerprint_display(self.peer_full_fingerprint)
 
             # Receive peer's info first (server sends first)
@@ -606,6 +642,14 @@ class CryptLinkApp:
                     self.gui_queue.put(("status", "Securely Connected"))
                     self._start_heartbeat()
                     self._communication_loop()
+                    # For remembered peers, use the IP address the client actually connected to (peer_host)
+                    # but keep the hostname and fingerprint from the PEER_INFO message received from the server.
+                    info_to_remember = self.peer_info.copy() # Contains hostname, reported IP, fingerprint from server
+                    info_to_remember["ip"] = peer_host # Override with the IP/host we successfully connected to
+                    self._log_message(f"CLIENT_INITIATE: Storing remembered peer with connection target IP/host {peer_host}, "
+                                      f"original reported IP was {self.peer_info.get('ip')}",
+                                      constants.LOG_LEVEL_DEBUG)
+                    self._add_remembered_peer(info_to_remember)
                 else:
                     reason = server_response.get("reason", "Server rejected connection") if server_response else "No response from server"
                     self._log_message(f"Connection rejected by peer: {reason}", constants.LOG_LEVEL_WARN)
@@ -643,12 +687,32 @@ class CryptLinkApp:
         if fingerprint_to_send is None:
             self._log_message("CRITICAL_INFO: _get_local_peer_info: self.local_full_fingerprint is None. Sending 'N/A_FP'.", constants.LOG_LEVEL_ERROR)
             fingerprint_to_send = "N/A_FP" # Send a placeholder
-        
+
         return {
             "hostname": self.local_hostname,
             "ip": self.local_ip,
             "fingerprint": fingerprint_to_send
         }
+
+    def _add_remembered_peer(self, peer_info_dict):
+        """Adds a peer's info to the remembered list, keeping it unique and limited."""
+        if not peer_info_dict or not peer_info_dict.get("fingerprint"):
+            self._log_message("Attempted to add invalid peer info to remembered list.", constants.LOG_LEVEL_WARN)
+            return
+        # Remove existing entry with the same fingerprint
+        self.remembered_peers = [
+            p for p in self.remembered_peers
+            if p.get("fingerprint") != peer_info_dict.get("fingerprint")
+        ]
+
+        # Add the new peer to the end
+        self.remembered_peers.append(peer_info_dict)
+
+        # Keep only the last MAX_REMEMBERED_PEERS
+        self.remembered_peers = self.remembered_peers[-constants.MAX_REMEMBERED_PEERS:]
+
+        self._save_app_settings() # Save the updated list
+        self.gui_queue.put(("update_peer_list_dropdown", None)) # Trigger GUI update
 
     def _verify_peer_fingerprint_dialog(self, peer_fp_display, callback):
         """Shows a dialog to verify the peer's certificate fingerprint."""
@@ -885,6 +949,7 @@ class CryptLinkApp:
         # If server was handling this connection, it's now free to accept new ones.
         # If client initiated this, it's now fully disconnected.
         # Restart server listening if it was stopped due to active connection
+        self.gui_queue.put(("update_peer_list_dropdown", None)) # Refresh dropdown after disconnect
         if was_connected and self.certs_loaded_correctly and (not self.server_thread or not self.server_thread.is_alive()):
              self._log_message("Attempting to restart server listening after disconnect.", constants.LOG_LEVEL_DEBUG)
              self._start_server_if_needed()
@@ -1448,6 +1513,10 @@ class CryptLinkApp:
         manual_id_config_enabled = self.app_settings.get("manual_id_config_enabled", False) # Default to False
         self.manual_id_config_enabled_var.set(manual_id_config_enabled)
 
+        # Load Remembered Peers
+        self.remembered_peers = self.app_settings.get("remembered_peers", [])
+        self._log_message(f"Loaded {len(self.remembered_peers)} remembered peers.", constants.LOG_LEVEL_DEBUG)
+
 
     def _save_app_settings(self):
         """Saves current application settings to the JSON file."""
@@ -1463,12 +1532,16 @@ class CryptLinkApp:
 
         gui.update_identities_view_visibility(self) # Update Identities view based on new setting
 
+        # Save Remembered Peers
+        self.app_settings["remembered_peers"] = self.remembered_peers
+
         try:
             os.makedirs(os.path.dirname(constants.SETTINGS_FILE_PATH), exist_ok=True)
             with open(constants.SETTINGS_FILE_PATH, 'w') as f:
                 json.dump(self.app_settings, f, indent=4)
             self._log_message(f"Settings saved to {constants.SETTINGS_FILE_PATH}", constants.LOG_LEVEL_INFO)
-            gui.visual_feedback(self, self.save_settings_button, "Save Settings", "Saved!") # Assumes save_settings_button exists on app
+            if hasattr(self, 'save_settings_button') and self.save_settings_button.winfo_exists(): # Check if button exists
+                gui.visual_feedback(self, self.save_settings_button, "Save Settings", "Saved!")
         except OSError as e:
             self._log_message(f"Error saving settings file: {e}", constants.LOG_LEVEL_ERROR)
             self.gui_queue.put(("show_error", f"Could not save settings:\n{e}"))
