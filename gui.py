@@ -22,13 +22,13 @@ except ImportError as e:
     # This basic error handling is for when gui.py itself is run or imported
     # in an environment where its siblings aren't found.
     # The main application (main.py) should handle robust error reporting.
-    print(f"ERROR (gui.py): Failed to import local modules (constants.py, utils.py): {e}", file=sys.stderr)
+    print(f"ERROR (gui.py): Failed to import local modules (constants.py, utils.py, settings.py): {e}", file=sys.stderr)
     print("Ensure all .py files are in the same directory or accessible in PYTHONPATH.", file=sys.stderr)
     # Attempt a Tkinter popup if possible, as a fallback
     try:
         root_err = tk.Tk()
         root_err.withdraw()
-        messagebox.showerror("GUI Import Error", f"Failed to import required modules for GUI: {e}\nEnsure constants.py and utils.py are present.")
+        messagebox.showerror("GUI Import Error", f"Failed to import required modules for GUI: {e}\nEnsure constants.py, utils.py, and settings.py are present.")
         root_err.destroy()
     except tk.TclError:
         pass # Fallback to console output if Tkinter isn't fully available
@@ -53,14 +53,14 @@ def create_widgets(app):
     app.root.columnconfigure(0, weight=1)
     app.root.rowconfigure(0, weight=1)
 
-    main_frame.columnconfigure(0, weight=0)
-    main_frame.columnconfigure(1, weight=1)
+    main_frame.columnconfigure(0, weight=3, uniform="group1")  # Left column gets 3 parts (approx 30%)
+    main_frame.columnconfigure(1, weight=7, uniform="group1")  # Right column gets 7 parts (approx 70%)
     main_frame.rowconfigure(0, weight=1)
     main_frame.rowconfigure(1, weight=1)
 
     # --- Left Column Frame ---
     left_frame = ttk.Frame(main_frame)
-    left_frame.grid(row=0, column=0, rowspan=2, sticky=(tk.W, tk.N, tk.S), padx=(0, 10))
+    left_frame.grid(row=0, column=0, rowspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10)) # Added tk.E
     left_frame.columnconfigure(0, weight=1)
     # Define rows for layout management
     for i in range(6): left_frame.rowconfigure(i, weight=0)
@@ -125,13 +125,13 @@ def create_widgets(app):
     app.status_label = ttk.Label(app.status_frame, textvariable=app.connection_status, font=('TkDefaultFont', 10, 'bold'))
     app.status_label.grid(row=0, column=1, sticky=tk.W, padx=5)
     ttk.Label(app.status_frame, text="Local:").grid(row=1, column=0, sticky=tk.W, padx=5)
-    app.local_info_label = ttk.Label(app.status_frame, text=f"{app.local_hostname} ({app.local_ip})", wraplength=250)
+    app.local_info_label = ttk.Label(app.status_frame, text=f"{app.local_hostname} ({app.local_ip})", wraplength=180) # Reduced wraplength
     app.local_info_label.grid(row=1, column=1, sticky=tk.W, padx=5)
     ttk.Label(app.status_frame, text="Local FP:").grid(row=2, column=0, sticky=tk.W, padx=5)
     app.local_fp_label = ttk.Label(app.status_frame, textvariable=app.local_fingerprint_display, font=('Courier', 9))
     app.local_fp_label.grid(row=2, column=1, sticky=tk.W, padx=5)
     ttk.Label(app.status_frame, text="Peer:").grid(row=3, column=0, sticky=tk.W, padx=5)
-    app.peer_info_label = ttk.Label(app.status_frame, textvariable=app.peer_hostname, wraplength=250)
+    app.peer_info_label = ttk.Label(app.status_frame, textvariable=app.peer_hostname, wraplength=180) # Reduced wraplength
     app.peer_info_label.grid(row=3, column=1, sticky=tk.W, padx=5)
     ttk.Label(app.status_frame, text="Peer FP:").grid(row=4, column=0, sticky=tk.W, padx=5)
     app.peer_fp_label = ttk.Label(app.status_frame, textvariable=app.peer_fingerprint_display, font=('Courier', 9))
@@ -194,7 +194,7 @@ def create_widgets(app):
 
     ttk.Label(client_admin_frame, text="Client Name (CN):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
     app.admin_client_cn_var = tk.StringVar()
-    app.admin_client_cn_entry = ttk.Entry(client_admin_frame, textvariable=app.admin_client_cn_var, width=30)
+    app.admin_client_cn_entry = ttk.Entry(client_admin_frame, textvariable=app.admin_client_cn_var, width=22) # Reduced width
     app.admin_client_cn_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
 
     app.admin_generate_bundle_button = ttk.Button(client_admin_frame, text="Generate Bundle", command=lambda: admin_generate_bundle(app), state='disabled')
