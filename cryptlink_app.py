@@ -1480,12 +1480,15 @@ class CryptLinkApp:
 
     def _quit_app(self):
         """Handles application shutdown."""
-        self._log_message("Quit command received. Shutting down...", constants.LOG_LEVEL_INFO)
+        quit_message = "Are you sure you want to quit CryptLink?"
         if self.is_transferring:
-            if not messagebox.askyesno("Confirm Quit", "A file transfer is in progress. Are you sure you want to quit?", parent=self.root):
-                self._log_message("Quit cancelled by user due to active transfer.", constants.LOG_LEVEL_INFO)
-                return
+            quit_message = "A file transfer is in progress. Are you sure you want to quit?"
 
+        if not messagebox.askyesno("Confirm Quit", quit_message, parent=self.root):
+            self._log_message("Quit cancelled by user.", constants.LOG_LEVEL_INFO)
+            return
+
+        self._log_message("Quit confirmed by user. Shutting down...", constants.LOG_LEVEL_INFO)
         # Prompt to save bundle if certs were manually loaded and not saved/exported
         if self.certs_loaded_correctly and not self.loaded_from_bundle and \
            not self.bundle_exported_this_session and not self.identity_loaded_from_keyring:

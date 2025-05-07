@@ -9,6 +9,7 @@ import sys
 import platform
 import subprocess
 import importlib.util
+import webbrowser # For opening URLs
 from pathlib import Path
 import tkinter.messagebox as messagebox # For error in open_file
 
@@ -121,6 +122,15 @@ def open_file_in_default_app(file_path):
         messagebox.showerror("Error", f"Command failed opening file '{file_path}': {e}")
     except Exception as e:
         messagebox.showerror("Error", f"Could not open file '{file_path}': {e}")
+
+def open_url_in_browser(url):
+    """Opens a URL in the default web browser."""
+    try:
+        webbrowser.open_new_tab(url)
+    except Exception as e:
+        # Log to console and show a simple Tkinter error if possible
+        print(f"Error opening URL '{url}': {e}")
+        messagebox.showerror("Error", f"Could not open URL:\n{url}\n\nError: {e}")
 
 def format_bytes(size):
     """Formats bytes into a human-readable string (KB, MB, GB)."""
