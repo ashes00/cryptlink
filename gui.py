@@ -19,17 +19,18 @@ try:
     import utils # utils.py will contain general utilities
     import settings # For create_settings_widgets
     import about # For create_about_widgets
+    import chat # For create_chat_widgets
 except ImportError as e:
     # This basic error handling is for when gui.py itself is run or imported
     # in an environment where its siblings aren't found.
     # The main application (main.py) should handle robust error reporting.
-    print(f"ERROR (gui.py): Failed to import local modules (constants.py, utils.py, settings.py, about.py): {e}", file=sys.stderr)
+    print(f"ERROR (gui.py): Failed to import local modules (constants.py, utils.py, settings.py, about.py, chat.py): {e}", file=sys.stderr)
     print("Ensure all .py files are in the same directory or accessible in PYTHONPATH.", file=sys.stderr)
     # Attempt a Tkinter popup if possible, as a fallback
     try:
         root_err = tk.Tk()
         root_err.withdraw()
-        messagebox.showerror("GUI Import Error", f"Failed to import required modules for GUI: {e}\nEnsure constants.py, utils.py, and settings.py are present.")
+        messagebox.showerror("GUI Import Error", f"Failed to import required modules for GUI: {e}\nEnsure constants.py, utils.py, settings.py, about.py, and chat.py are present.")
         root_err.destroy()
     except tk.TclError:
         pass # Fallback to console output if Tkinter isn't fully available
@@ -47,6 +48,7 @@ def create_widgets(app):
     app.menu_bar.add_command(label="Identities", command=lambda: show_identities_view(app), state='normal')
     app.menu_bar.add_command(label="Admin Tools", command=lambda: show_admin_tools_view(app), state='normal')
     app.menu_bar.add_command(label="Settings", command=lambda: show_settings_view(app), state='normal')
+    app.menu_bar.add_command(label="Chat", command=lambda: show_chat_view(app), state='disabled') # New Chat menu item
     app.menu_bar.add_command(label="About", command=lambda: show_about_view(app), state='normal')
 
     # --- Main Frame Setup (2 Columns) ---
@@ -233,6 +235,10 @@ def create_widgets(app):
     app.about_view_frame_container = about.create_about_widgets(app, main_frame)
     # It's not gridded here; show_about_view will grid it.
 
+    # --- Chat View Frame (created by chat.py, initially hidden) ---
+    # This frame is also a direct child of main_frame.
+    app.chat_view_frame_container = chat.create_chat_widgets(app, main_frame)
+
     # --- Quit Button (always visible at the bottom of left_frame) ---
     app.quit_button = ttk.Button(app.left_frame, text="Quit", command=app._quit_app)
     app.quit_button.grid(row=5, column=0, sticky=tk.E, pady=10, padx=5)
@@ -296,6 +302,7 @@ def set_connection_status(app, status):
     """Sets the connection status string and updates the UI display."""
     app.connection_status.set(status)
     update_status_display(app)
+    update_chat_status_display(app) # Also update the chat view's status replica
     update_identity_persistence_buttons_state(app)
 
 def update_status_display(app):
@@ -306,6 +313,7 @@ def update_status_display(app):
     choose_file_button_state = 'disabled'; send_file_button_state = 'disabled'; cancel_button_state = 'disabled'
     export_bundle_button_state = 'disabled'; import_bundle_button_state = 'normal'
     save_certs_button_state = 'normal' if (app.ca_cert_display_name.get() and app.client_cert_display_name.get() and app.client_key_display_name.get()) else 'disabled'
+    chat_menu_state = 'disabled' # For the Chat menu item
     status_color = "red"
 
     if status == "No Certs": pass
@@ -325,6 +333,7 @@ def update_status_display(app):
         status_color = "purple"; disconnect_button_state = 'normal'; import_bundle_button_state = 'disabled'
         export_bundle_button_state = 'disabled'; save_certs_button_state = 'disabled'
     elif status == "Securely Connected":
+        chat_menu_state = 'normal' # Enable Chat menu when connected
         status_color = "green"; disconnect_button_state = 'normal'; choose_file_button_state = 'normal'
         send_file_button_state = 'normal' if app.file_to_send_path.get() else 'disabled'
         export_bundle_button_state = 'normal'; import_bundle_button_state = 'disabled'; save_certs_button_state = 'disabled'
@@ -340,6 +349,7 @@ def update_status_display(app):
         if hasattr(app, 'save_certs_button'): app.save_certs_button.config(state=save_certs_button_state)
         if hasattr(app, 'import_bundle_button'): app.import_bundle_button.config(state=import_bundle_button_state)
         if hasattr(app, 'export_bundle_button'): app.export_bundle_button.config(state=export_bundle_button_state)
+        if hasattr(app, 'menu_bar'): app.menu_bar.entryconfig("Chat", state=chat_menu_state)
 
         if app.is_transferring:
             if hasattr(app, 'cancel_button'): app.cancel_button.config(state='normal')
@@ -350,6 +360,7 @@ def update_status_display(app):
             if hasattr(app, 'import_bundle_button'): app.import_bundle_button.config(state='disabled')
             if hasattr(app, 'export_bundle_button'): app.export_bundle_button.config(state='disabled')
             if hasattr(app, 'save_certs_button'): app.save_certs_button.config(state='disabled')
+            if hasattr(app, 'menu_bar'): app.menu_bar.entryconfig("Chat", state='disabled') # Disable chat during transfer
             if hasattr(app, 'save_identity_button'): app.save_identity_button.config(state='disabled')
         else:
             if hasattr(app, 'cancel_button'): app.cancel_button.config(state='disabled')
@@ -931,6 +942,7 @@ def show_main_view(app):
         if hasattr(app, 'admin_tools_frame'): app.admin_tools_frame.grid_forget()
         if hasattr(app, 'about_view_frame_container') and app.about_view_frame_container: app.about_view_frame_container.grid_forget()
         if hasattr(app, 'settings_view_frame_container') and app.settings_view_frame_container: app.settings_view_frame_container.grid_forget()
+        if hasattr(app, 'chat_view_frame_container') and app.chat_view_frame_container: app.chat_view_frame_container.grid_forget()
 
 
         # Show main view widgets in left_frame
@@ -944,6 +956,7 @@ def show_main_view(app):
         app.menu_bar.entryconfig("Identities", state='normal')
         app.menu_bar.entryconfig("Admin Tools", state='normal')
         app.menu_bar.entryconfig("Settings", state='normal')
+        app.menu_bar.entryconfig("Chat", state='normal' if app.is_connected else 'disabled')
         app.menu_bar.entryconfig("About", state='normal')
         app._log_message("Switched to Main View.", constants.LOG_LEVEL_DEBUG)
         update_status_display(app) # Refresh button states
@@ -969,6 +982,7 @@ def show_identities_view(app):
         if hasattr(app, 'admin_tools_frame'): app.admin_tools_frame.grid_forget()
         if hasattr(app, 'about_view_frame_container') and app.about_view_frame_container: app.about_view_frame_container.grid_forget()
         if hasattr(app, 'settings_view_frame_container') and app.settings_view_frame_container: app.settings_view_frame_container.grid_forget()
+        if hasattr(app, 'chat_view_frame_container') and app.chat_view_frame_container: app.chat_view_frame_container.grid_forget()
 
 
         # Show identities widgets in left_frame
@@ -982,6 +996,7 @@ def show_identities_view(app):
         app.menu_bar.entryconfig("Identities", state='disabled')
         app.menu_bar.entryconfig("Admin Tools", state='normal')
         app.menu_bar.entryconfig("Settings", state='normal')
+        app.menu_bar.entryconfig("Chat", state='normal' if app.is_connected else 'disabled')
         app.menu_bar.entryconfig("About", state='normal')
         app._log_message("Switched to Identities View.", constants.LOG_LEVEL_DEBUG)
     except AttributeError as e:
@@ -1007,6 +1022,7 @@ def show_admin_tools_view(app):
         if hasattr(app, 'identity_persistence_frame'): app.identity_persistence_frame.grid_forget()
         if hasattr(app, 'about_view_frame_container') and app.about_view_frame_container: app.about_view_frame_container.grid_forget()
         if hasattr(app, 'settings_view_frame_container') and app.settings_view_frame_container: app.settings_view_frame_container.grid_forget()
+        if hasattr(app, 'chat_view_frame_container') and app.chat_view_frame_container: app.chat_view_frame_container.grid_forget()
 
 
         # Show admin tools frame in left_frame
@@ -1018,6 +1034,7 @@ def show_admin_tools_view(app):
         app.menu_bar.entryconfig("Identities", state='normal')
         app.menu_bar.entryconfig("Admin Tools", state='disabled')
         app.menu_bar.entryconfig("Settings", state='normal')
+        app.menu_bar.entryconfig("Chat", state='normal' if app.is_connected else 'disabled')
         app.menu_bar.entryconfig("About", state='normal')
         app._log_message("Switched to Admin Tools View.", constants.LOG_LEVEL_DEBUG)
     except AttributeError as e:
@@ -1042,6 +1059,7 @@ def show_settings_view(app):
         if hasattr(app, 'identity_persistence_frame'): app.identity_persistence_frame.grid_forget()
         if hasattr(app, 'admin_tools_frame'): app.admin_tools_frame.grid_forget()
         if hasattr(app, 'about_view_frame_container') and app.about_view_frame_container: app.about_view_frame_container.grid_forget()
+        if hasattr(app, 'chat_view_frame_container') and app.chat_view_frame_container: app.chat_view_frame_container.grid_forget()
 
 
         # Show settings frame in left_frame
@@ -1052,10 +1070,42 @@ def show_settings_view(app):
         app.menu_bar.entryconfig("Identities", state='normal')
         app.menu_bar.entryconfig("Admin Tools", state='normal')
         app.menu_bar.entryconfig("Settings", state='disabled')
+        app.menu_bar.entryconfig("Chat", state='normal' if app.is_connected else 'disabled')
         app.menu_bar.entryconfig("About", state='normal')
         app._log_message("Switched to Settings View.", constants.LOG_LEVEL_DEBUG)
     except AttributeError as e:
         app._log_message(f"Error switching to Settings View (widgets might not be fully initialized): {e}", constants.LOG_LEVEL_WARN)
+
+def show_chat_view(app):
+    """Shows the Chat view, hides others."""
+    if not app.is_connected:
+        app.gui_queue.put(("show_error", "Chat is only available when connected to a peer."))
+        # Optionally switch back to home view or do nothing
+        if app.menu_bar.entrycget("Home", "state") == 'normal': # Check if Home is not already disabled
+            show_main_view(app)
+        return
+    try:
+        # Hide the standard two-column layout frames and other specific view containers
+        if hasattr(app, 'left_frame'): app.left_frame.grid_forget()
+        if hasattr(app, 'received_frame'): app.received_frame.grid_forget()
+        if hasattr(app, 'log_frame_outer'): app.log_frame_outer.grid_forget()
+        if hasattr(app, 'settings_view_frame_container') and app.settings_view_frame_container: app.settings_view_frame_container.grid_forget()
+        if hasattr(app, 'about_view_frame_container') and app.about_view_frame_container: app.about_view_frame_container.grid_forget()
+
+        # Show Chat frame, making it span the main_frame
+        if hasattr(app, 'chat_view_frame_container') and app.chat_view_frame_container:
+            app.chat_view_frame_container.grid(row=0, column=0, rowspan=2, columnspan=2, sticky="nsew")
+            update_chat_status_display(app) # Refresh status display within chat view
+
+        app.menu_bar.entryconfig("Home", state='normal')
+        app.menu_bar.entryconfig("Identities", state='normal')
+        app.menu_bar.entryconfig("Admin Tools", state='normal')
+        app.menu_bar.entryconfig("Settings", state='normal')
+        app.menu_bar.entryconfig("Chat", state='disabled')
+        app.menu_bar.entryconfig("About", state='normal')
+        app._log_message("Switched to Chat View.", constants.LOG_LEVEL_DEBUG)
+    except AttributeError as e:
+        app._log_message(f"Error switching to Chat View (widgets might not be fully initialized): {e}", constants.LOG_LEVEL_WARN)
 
 def show_about_view(app):
     """Shows the About view, hides others."""
@@ -1067,6 +1117,7 @@ def show_about_view(app):
 
         # Hide other specific view containers if they exist (e.g., settings)
         if hasattr(app, 'settings_view_frame_container') and app.settings_view_frame_container: app.settings_view_frame_container.grid_forget()
+        if hasattr(app, 'chat_view_frame_container') and app.chat_view_frame_container: app.chat_view_frame_container.grid_forget()
         # Note: Individual frames within left_frame (like conn_frame) are managed by their own show_..._view calls.
         # Here, we are primarily concerned with hiding the main layout components.
 
@@ -1078,6 +1129,7 @@ def show_about_view(app):
         app.menu_bar.entryconfig("Identities", state='normal')
         app.menu_bar.entryconfig("Admin Tools", state='normal')
         app.menu_bar.entryconfig("Settings", state='normal')
+        app.menu_bar.entryconfig("Chat", state='normal' if app.is_connected else 'disabled')
         app.menu_bar.entryconfig("About", state='disabled')
         app._log_message("Switched to About View.", constants.LOG_LEVEL_DEBUG)
     except AttributeError as e:
@@ -1159,3 +1211,73 @@ def update_identities_view_visibility(app):
         check_enable_load_certs(app)
     # If manual_config_enabled is False, the loop above already disabled save_certs_button and export_bundle_button.
     # If it's True, check_enable_load_certs() will set their state appropriately.
+
+def append_chat_message(app, sender_type, text, timestamp_str=None):
+    """Appends a message to the chat conversation area with appropriate styling."""
+    if not hasattr(app, 'chat_conversation_area') or not app.chat_conversation_area.winfo_exists():
+        return
+
+    try:
+        app.chat_conversation_area.config(state='normal')
+        if timestamp_str is None:
+            timestamp_str = datetime.datetime.now().strftime("%I:%M:%S %p") # 12-hour format with AM/PM
+
+        # Determine sender name for display and the tags to use
+        sender_name = ""
+        sender_name_tag = ""
+        message_content_tag = ""
+        timestamp_tag = ""
+
+        # Use local hostname for local messages
+        if sender_type == "local":
+            sender_name_display = app.local_hostname
+            sender_name_tag = "local_sender_name"
+            message_content_tag = "local_message_content"
+            timestamp_tag = "local_timestamp_tag" # New tag for local timestamp
+        # Use peer hostname (which includes IP) for peer messages
+        elif sender_type == "peer":
+            # Prioritize hostname from peer_info if available and not "N/A"
+            peer_info_hostname = app.peer_info.get('hostname')
+            if peer_info_hostname and peer_info_hostname != "N/A":
+                sender_name_display = peer_info_hostname
+            else:
+                # Fallback to IP from peer_info
+                peer_info_ip = app.peer_info.get('ip')
+                if peer_info_ip and peer_info_ip != "N/A":
+                    sender_name_display = peer_info_ip
+                else:
+                    # Last resort, try to parse from app.peer_hostname (which is "Hostname (IP)")
+                    full_peer_display = app.peer_hostname.get()
+                    if full_peer_display and full_peer_display != "N/A":
+                        sender_name_display = full_peer_display.split(' (')[0] # Get part before " ("
+                    else:
+                        sender_name_display = "Peer" # Absolute fallback
+            sender_name_tag = "peer_sender_name"
+            message_content_tag = "peer_message_content"
+            timestamp_tag = "peer_timestamp_tag" # New tag for peer timestamp
+        else: # System message
+            app.chat_conversation_area.insert(tk.END, f"{text}\n", "system_message")
+            app.chat_conversation_area.see(tk.END) # Scroll to the bottom
+            app.chat_conversation_area.config(state='disabled')
+            return # Exit the function for system messages
+
+        # Insert the first line: [Sender Name] (bold) followed by Message (normal color)
+        app.chat_conversation_area.insert(tk.END, f"[{sender_name_display}] ", sender_name_tag)
+        app.chat_conversation_area.insert(tk.END, f"{text}\n", message_content_tag)
+
+        # Format and insert the second line: Timestamp
+        timestamp_line = f"{timestamp_str}\n"
+        app.chat_conversation_area.insert(tk.END, timestamp_line, timestamp_tag) # Use specific timestamp tag
+
+        app.chat_conversation_area.see(tk.END) # Scroll to the bottom
+        app.chat_conversation_area.config(state='disabled')
+    except tk.TclError as e:
+        app._log_message(f"Error appending chat message (widget likely destroyed): {e}", constants.LOG_LEVEL_DEBUG)
+
+def update_chat_status_display(app):
+    """Updates the status labels within the Chat view's left column."""
+    if not hasattr(app, 'chat_view_status_label') or not app.chat_view_status_label.winfo_exists():
+        return # Chat view widgets not ready or not visible
+
+    app.chat_view_status_label.config(foreground=app.status_label.cget("foreground")) # Match color from main status
+    # The textVariables are already bound, so they update automatically. This ensures color sync.

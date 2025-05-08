@@ -129,6 +129,7 @@ class CryptLinkApp:
         self.client_connection_thread = None # For outgoing connections
         self.heartbeat_thread = None
         self.heartbeat_lock = threading.Lock()
+        # self._socket_write_lock = threading.Lock() # This was added in a previous step for bug fix
         self._socket_write_lock = threading.Lock() # ADD THIS LINE for serializing socket writes
         self.last_heartbeat_ack_time = 0
         self.sender_status_clear_timer = None # For gui.py to manage
@@ -136,6 +137,22 @@ class CryptLinkApp:
         # --- Admin Tools Specific ---
         self.admin_ca_cert = None # Stores loaded CA cert (PEM bytes) for admin use
         self.admin_ca_key = None  # Stores loaded CA key (PEM bytes) for admin use
+
+        # --- Chat Feature State ---
+        # Chat view widgets will be assigned here after creation by chat.create_chat_widgets
+        self.chat_view_frame_container = None
+        self.chat_status_frame_replica = None # The status frame within the chat view
+        self.chat_view_status_label = None
+        self.chat_view_local_info_label = None
+        self.chat_view_local_fp_label = None
+        self.chat_view_peer_info_label = None
+        self.chat_view_peer_fp_label = None
+        self.chat_right_frame = None
+        self.chat_conversation_area = None
+        self.chat_input_frame = None
+        self.chat_message_entry = None
+        self.chat_send_button = None
+        self.chat_view_quit_button = None # For the new quit button in chat view
 
         # --- Application Settings ---
         self.app_settings = {} # Will be loaded from file
@@ -208,6 +225,8 @@ class CryptLinkApp:
                     self._verify_peer_fingerprint_dialog(peer_fp_display, callback)
                 elif msg_type == "update_peer_list_dropdown":
                     gui.update_peer_list_dropdown(self) # Call the GUI function to update the dropdown
+                elif msg_type == "chat_message_display": # New queue message type for chat
+                    gui.append_chat_message(self, data['sender_type'], data['text'], data.get('timestamp'))
                 elif msg_type == "prompt_file_accept":
                     filename, filesize_str, callback = data
                     self._prompt_accept_file_dialog(filename, filesize_str, callback)
@@ -499,6 +518,7 @@ class CryptLinkApp:
                 self.is_connecting = False
                 self.gui_queue.put(("status", "Securely Connected"))
                 self._start_heartbeat()
+                # gui.update_status_display(self) # Ensure chat menu is enabled
                 self._communication_loop() # Start receiving commands
                 # For remembered peers, use the IP address the server actually saw the connection from (peer_ip)
                 # but keep the hostname and fingerprint from the PEER_INFO message.
@@ -642,6 +662,7 @@ class CryptLinkApp:
                     self.is_connecting = False
                     self.gui_queue.put(("status", "Securely Connected"))
                     self._start_heartbeat()
+                    # gui.update_status_display(self) # Ensure chat menu is enabled
                     self._communication_loop()
                     # For remembered peers, use the IP address the client actually connected to (peer_host)
                     # but keep the hostname and fingerprint from the PEER_INFO message received from the server.
@@ -765,13 +786,12 @@ class CryptLinkApp:
         command_json = json.dumps(command_dict)
         if len(command_json) > constants.MAX_CMD_LEN:
             self._log_message(f"Command too long to send: {len(command_json)} bytes. Type: {command_dict.get('type', 'Unknown')}", constants.LOG_LEVEL_ERROR)
-            if command_dict.get("type") != "FILE_CHUNK": # Should not happen for non-chunks
+            if command_dict.get("type") != "FILE_CHUNK":
                 self._disconnect_peer(reason="Command too long")
-                return # Do not attempt to send
+                return False # Explicitly return False
             # If it's a FILE_CHUNK, this indicates a serious issue with chunking logic.
-            # For now, we'll prevent sending it to avoid further errors.
             self._disconnect_peer(reason="Oversized file chunk (internal error)")
-            return
+            return False # Explicitly return False
 
         command_bytes = command_json.encode('utf-8')
         length_prefix = len(command_bytes).to_bytes(4, 'big')
@@ -779,13 +799,18 @@ class CryptLinkApp:
         with self._socket_write_lock: # Acquire lock before writing
             if not sock or self.stop_event.is_set() or (hasattr(sock, '_closed') and sock._closed): # Check if socket is still valid
                 self._log_message(f"Send command ({command_dict.get('type')}): Socket closed or stop event set (after lock).", constants.LOG_LEVEL_DEBUG)
-                return # Don't proceed if socket is invalid
+                return False
             try:
                 sock.sendall(length_prefix + command_bytes)
                 self._log_message(f"Sent command: {log_cmd_dict}", constants.LOG_LEVEL_DEBUG) # Use the prepared log_cmd_dict
+                return True # Indicate success
             except (socket.error, ssl.SSLError, AttributeError, ValueError) as e:
                 self._log_message(f"Error sending command: {e}. Command type: {command_dict.get('type', 'Unknown')}", constants.LOG_LEVEL_ERROR)
                 self._disconnect_peer(reason=f"Send error: {e}") # Disconnect on send error
+                return False
+        # Fallback if logic somehow exits the 'with' block without returning (should not happen)
+        self._log_message(f"Command send ({command_dict.get('type')}) exited _socket_write_lock without explicit return.", constants.LOG_LEVEL_WARN)
+        return False
 
     def _receive_command(self, sock):
         """Receives a JSON command from the SSL socket."""
@@ -875,6 +900,8 @@ class CryptLinkApp:
                     # No specific action needed here by the receiver of this message in the main loop.
                 elif cmd_type == "CANCEL_TRANSFER":
                     self._handle_cancel_transfer_command(cmd_data)
+                elif cmd_type == "CHAT_MESSAGE": # Handle incoming chat messages
+                    self._handle_chat_message_command(cmd_data) # Corrected handler
                 # VERIFICATION_ACCEPTED/REJECTED are handled during connection setup
                 else:
                     self._log_message(f"Received unknown command type: {cmd_type}", constants.LOG_LEVEL_WARN)
@@ -936,6 +963,7 @@ class CryptLinkApp:
         self.is_connected = False
         self.is_connecting = False # Also reset if was in connecting state
 
+        gui.update_status_display(self) # Update menu states, including Chat
         if self.is_transferring:
             self._cancel_transfer(notify_peer=False) # Cancel local transfer, don't notify if connection is already dead
 
@@ -1354,6 +1382,37 @@ class CryptLinkApp:
         self._reset_transfer_state()
         self.gui_queue.put(("transfer_cancelled_ui", role_is_sender))
 
+    def _send_chat_message_action(self):
+        """Sends the current chat message to the peer."""
+        if not self.is_connected:
+            self.gui_queue.put(("show_error", "Not connected to a peer to send chat message."))
+            return
+        if not hasattr(self, 'chat_message_entry') or not self.chat_message_entry: # Check if chat UI is initialized
+            self._log_message("Chat UI not ready for sending message.", constants.LOG_LEVEL_WARN)
+            return
+
+        message_text = self.chat_message_entry.get("1.0", tk.END).strip() # Get text from Text widget
+        if not message_text:
+            return # Don't send empty messages
+
+        success = self._send_command(self.client_socket, {"type": "CHAT_MESSAGE", "data": {"text": message_text}})
+        if success:
+            # Display sent message locally
+            timestamp = datetime.datetime.now().strftime("%I:%M:%S %p") # Use 12-hour format
+            self.gui_queue.put(("chat_message_display", {"sender_type": "local", "text": message_text, "timestamp": timestamp}))
+            self.chat_message_entry.delete("1.0", tk.END) # Clear Text widget
+            self._log_message(f"Sent chat message: {message_text}", constants.LOG_LEVEL_DEBUG)
+        else:
+            self._log_message("Failed to send chat message.", constants.LOG_LEVEL_ERROR)
+            # Error handling (e.g., disconnect) is likely handled by _send_command
+        return "break" # Prevents the default Enter key behavior (newline) in the Text widget
+
+    def _handle_chat_message_command(self, data):
+        """Handles an incoming CHAT_MESSAGE command from the peer."""
+        message_text = data.get("text", "")
+        timestamp = datetime.datetime.now().strftime("%I:%M:%S %p") # Use 12-hour format
+        self.gui_queue.put(("chat_message_display", {"sender_type": "peer", "text": message_text, "timestamp": timestamp}))
+        self._log_message(f"Received chat message: {message_text}", constants.LOG_LEVEL_DEBUG)
 
     def _reset_transfer_state(self):
         """Resets all variables related to an active file transfer."""

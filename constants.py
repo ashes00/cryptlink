@@ -7,7 +7,7 @@ from pathlib import Path
 
 # --- Application Info ---
 APP_NAME = "CryptLink"
-APP_VERSION = "0.4.1" # Or your current version
+APP_VERSION = "0.4.2"
 
 # --- Networking ---
 DEFAULT_PORT = 7900
