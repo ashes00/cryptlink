@@ -129,6 +129,7 @@ class CryptLinkApp:
         self.client_connection_thread = None # For outgoing connections
         self.heartbeat_thread = None
         self.heartbeat_lock = threading.Lock()
+        self._socket_write_lock = threading.Lock() # ADD THIS LINE for serializing socket writes
         self.last_heartbeat_ack_time = 0
         self.sender_status_clear_timer = None # For gui.py to manage
 
@@ -749,31 +750,42 @@ class CryptLinkApp:
         if not sock:
             self._log_message("Send command failed: socket is None.", constants.LOG_LEVEL_ERROR)
             return
-        try:
-            command_json = json.dumps(command_dict)
-            if len(command_json) > constants.MAX_CMD_LEN: # Corrected constant name
-                self._log_message(f"Command too long to send: {len(command_json)} bytes. Type: {command_dict.get('type', 'Unknown')}", constants.LOG_LEVEL_ERROR)
-                # For file chunks, this should not happen due to chunking.
-                # For other commands, this indicates a design issue or unexpected data.
-                if command_dict.get("type") != "FILE_CHUNK": # Don't disconnect for long file chunks (should be impossible)
-                    raise ValueError("Command too long")
-                # If it's a file chunk, something is very wrong with chunking logic.
-                # For now, we'll let it try to send and likely fail or be handled by peer.
 
-            command_bytes = command_json.encode('utf-8')
-            # Simple framing: send length first, then data
-            length_prefix = len(command_bytes).to_bytes(4, 'big')
-            sock.sendall(length_prefix + command_bytes)
-            # Log sensitive data carefully
-            log_cmd_dict = command_dict.copy()
-            if log_cmd_dict.get("type") == "FILE_CHUNK" and "data" in log_cmd_dict and isinstance(log_cmd_dict["data"], dict):
-                original_chunk_b64 = log_cmd_dict["data"].get("chunk", "")
+        # Prepare a display version for logging, especially for FILE_CHUNK
+        log_cmd_dict = command_dict.copy()
+        if log_cmd_dict.get("type") == "FILE_CHUNK" and "data" in log_cmd_dict and isinstance(log_cmd_dict["data"], dict):
+            original_chunk_b64 = log_cmd_dict["data"].get("chunk", "") # Assuming 'chunk' holds the b64 data
+            try:
                 # Log the length of the original binary data, not the base64 string
-                log_cmd_dict["data"] = f"<FILE_CHUNK: original data len {len(base64.b64decode(original_chunk_b64.encode('ascii') if isinstance(original_chunk_b64, str) else original_chunk_b64))}>"
-            self._log_message(f"Sent command: {log_cmd_dict}", constants.LOG_LEVEL_DEBUG)
-        except (socket.error, ssl.SSLError, AttributeError, ValueError) as e: # Added AttributeError for sock=None case, ValueError for long command
-            self._log_message(f"Error sending command: {e}. Command type: {command_dict.get('type', 'Unknown')}", constants.LOG_LEVEL_ERROR)
-            self._disconnect_peer(reason=f"Send error: {e}") # Disconnect on send error
+                decoded_chunk_len = len(base64.b64decode(original_chunk_b64.encode('ascii') if isinstance(original_chunk_b64, str) else original_chunk_b64))
+                log_cmd_dict["data"] = f"<FILE_CHUNK: original data len {decoded_chunk_len}>"
+            except Exception: # Fallback if b64decode fails or data isn't as expected
+                log_cmd_dict["data"] = "<FILE_CHUNK: error preparing log display>"
+
+        command_json = json.dumps(command_dict)
+        if len(command_json) > constants.MAX_CMD_LEN:
+            self._log_message(f"Command too long to send: {len(command_json)} bytes. Type: {command_dict.get('type', 'Unknown')}", constants.LOG_LEVEL_ERROR)
+            if command_dict.get("type") != "FILE_CHUNK": # Should not happen for non-chunks
+                self._disconnect_peer(reason="Command too long")
+                return # Do not attempt to send
+            # If it's a FILE_CHUNK, this indicates a serious issue with chunking logic.
+            # For now, we'll prevent sending it to avoid further errors.
+            self._disconnect_peer(reason="Oversized file chunk (internal error)")
+            return
+
+        command_bytes = command_json.encode('utf-8')
+        length_prefix = len(command_bytes).to_bytes(4, 'big')
+
+        with self._socket_write_lock: # Acquire lock before writing
+            if not sock or self.stop_event.is_set() or (hasattr(sock, '_closed') and sock._closed): # Check if socket is still valid
+                self._log_message(f"Send command ({command_dict.get('type')}): Socket closed or stop event set (after lock).", constants.LOG_LEVEL_DEBUG)
+                return # Don't proceed if socket is invalid
+            try:
+                sock.sendall(length_prefix + command_bytes)
+                self._log_message(f"Sent command: {log_cmd_dict}", constants.LOG_LEVEL_DEBUG) # Use the prepared log_cmd_dict
+            except (socket.error, ssl.SSLError, AttributeError, ValueError) as e:
+                self._log_message(f"Error sending command: {e}. Command type: {command_dict.get('type', 'Unknown')}", constants.LOG_LEVEL_ERROR)
+                self._disconnect_peer(reason=f"Send error: {e}") # Disconnect on send error
 
     def _receive_command(self, sock):
         """Receives a JSON command from the SSL socket."""
